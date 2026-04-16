@@ -41,14 +41,12 @@ Frontend: copiar `frontend/.env.example` a `frontend/.env.local`
 1. Base de datos:
 
 ```powershell
-cd "C:\Users\Aaron\Desktop\COSAS\Proyecto 02"
 docker compose up -d
 ```
 
 2. Backend:
 
 ```powershell
-cd "C:\Users\Aaron\Desktop\COSAS\Proyecto 02\backend"
 python -m pip install -r requirements.txt
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
@@ -56,7 +54,6 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 3. Frontend:
 
 ```powershell
-cd "C:\Users\Aaron\Desktop\COSAS\Proyecto 02\frontend"
 npm install
 npm run dev
 ```
@@ -70,7 +67,6 @@ API: `http://127.0.0.1:8000`
 Frontend:
 
 ```powershell
-cd "C:\Users\Aaron\Desktop\COSAS\Proyecto 02\frontend"
 npm run lint
 npm run build
 ```
@@ -78,6 +74,5 @@ npm run build
 Backend:
 
 ```powershell
-cd "C:\Users\Aaron\Desktop\COSAS\Proyecto 02\backend"
 python scripts/smoke_test.py
 ```
