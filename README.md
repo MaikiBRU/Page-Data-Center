@@ -81,15 +81,3 @@ Backend:
 cd "C:\Users\Aaron\Desktop\COSAS\Proyecto 02\backend"
 python scripts/smoke_test.py
 ```
-
-## Publicacion en GitHub
-
-Este repo ya queda preparado para publicarse sin:
-
-- `.env` ni credenciales locales
-- caches npm
-- logs runtime
-- `__pycache__`
-- uploads generados localmente
-
-Antes de publicar, rotar credenciales reales de Google/SendGrid desde sus consolas si alguna vez se usaron fuera del entorno local.
