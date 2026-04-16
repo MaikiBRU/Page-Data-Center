@@ -1,0 +1,14 @@
+fastapi==0.115.2
+httpx==0.28.1
+uvicorn[standard]==0.30.6
+SQLAlchemy==2.0.34
+psycopg[binary]==3.3.3
+pydantic-settings==2.6.1
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==3.2.2
+python-multipart==0.0.9
+email-validator==2.1.1
+sendgrid==6.11.0
+google-auth==2.35.0
+reportlab==4.1.0

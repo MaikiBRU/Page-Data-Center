@@ -1,0 +1,392 @@
+@import "tailwindcss";
+
+:root {
+  --bg-0: #050505;
+  --bg-1: #0b0c10;
+  --panel: #0f1217;
+  --panel-2: #141821;
+  --panel-border: rgba(255, 255, 255, 0.08);
+  --panel-highlight: rgba(255, 255, 255, 0.1);
+  --accent-glow: rgba(255, 122, 26, 0.35);
+  --accent: #ff7a1a;
+  --accent-2: #ffb36a;
+  --text: #f5f5f5;
+  --muted: #9aa0aa;
+  --success: #39d98a;
+  --warning: #f6c453;
+  --danger: #ff5b6b;
+  color-scheme: dark;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+::selection {
+  background: rgba(255, 122, 26, 0.25);
+  color: #ffffff;
+}
+
+body {
+  background: radial-gradient(circle at 15% 10%, rgba(255, 122, 26, 0.2), transparent 42%),
+    radial-gradient(circle at 85% 0%, rgba(255, 179, 106, 0.12), transparent 40%),
+    linear-gradient(180deg, var(--bg-1) 0%, var(--bg-0) 60%);
+  color: var(--text);
+  font-family: var(--font-body), system-ui, sans-serif;
+  min-height: 100vh;
+  text-rendering: optimizeLegibility;
+  user-select: none;
+  cursor: default;
+}
+
+select {
+  appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, rgba(255, 255, 255, 0.6) 50%),
+    linear-gradient(135deg, rgba(255, 255, 255, 0.6) 50%, transparent 50%);
+  background-position: calc(100% - 18px) calc(50% - 3px), calc(100% - 12px) calc(50% - 3px);
+  background-size: 6px 6px, 6px 6px;
+  background-repeat: no-repeat;
+  padding-right: 2.5rem;
+}
+
+select option {
+  background-color: #0f1217;
+  color: #f5f5f5;
+}
+
+input[type="number"] {
+  appearance: textfield;
+}
+
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+  opacity: 1;
+  filter: invert(1) brightness(0.8);
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background-image: linear-gradient(rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+  background-size: 160px 160px;
+  pointer-events: none;
+  opacity: 0.22;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+a,
+button,
+[role="button"] {
+  cursor: pointer;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+input,
+textarea {
+  user-select: auto;
+  cursor: text;
+}
+
+select {
+  user-select: none;
+  cursor: pointer;
+}
+
+h1, h2, h3 {
+  letter-spacing: -0.01em;
+}
+
+*:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(255, 122, 26, 0.35);
+  border-radius: 10px;
+}
+
+h1, h2, h3 {
+  font-family: var(--font-display), system-ui, sans-serif;
+}
+
+.input-base {
+  @apply w-full rounded-xl border border-white/10 bg-white/5 px-4 py-2 text-sm text-white placeholder:text-white/40 outline-none transition focus:border-[var(--accent)]/60 focus:bg-white/10;
+}
+
+.btn-primary {
+  @apply inline-flex items-center justify-center gap-2 rounded-xl bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-black shadow-[0_10px_30px_rgba(255,122,26,0.22)] transition hover:brightness-110 active:translate-y-[1px];
+}
+
+.btn-secondary {
+  @apply inline-flex items-center justify-center gap-2 rounded-xl border border-white/15 bg-white/5 px-4 py-2 text-sm font-semibold text-white transition hover:border-white/40 hover:bg-white/10 active:translate-y-[1px];
+}
+
+.btn-mini {
+  @apply inline-flex items-center justify-center gap-1 rounded-full border border-[var(--accent)]/50 bg-[var(--accent)]/15 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.2em] text-[var(--accent-2)] transition hover:border-[var(--accent)] hover:bg-[var(--accent)]/25 hover:text-white active:translate-y-[1px];
+}
+
+.btn-mini:disabled,
+.btn-primary:disabled,
+.btn-secondary:disabled {
+  @apply cursor-not-allowed opacity-60;
+}
+
+.input-base:disabled,
+select:disabled,
+textarea:disabled {
+  @apply cursor-not-allowed opacity-70;
+}
+
+.panel {
+  @apply rounded-2xl border border-white/10 bg-[var(--panel)]/95 p-6 shadow-[0_26px_90px_rgba(5,5,5,0.55)];
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
+.panel table {
+  border-collapse: separate;
+  border-spacing: 0;
+}
+
+.panel table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: rgba(16, 18, 22, 0.95);
+}
+
+.panel table tr:hover td {
+  background-color: rgba(255, 255, 255, 0.04);
+}
+
+.panel table td,
+.panel table th {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.panel table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.card-row {
+  @apply flex flex-wrap items-center justify-between gap-3 rounded-xl border border-white/10 bg-white/5 px-4 py-3 text-sm transition;
+}
+
+.card-row:hover {
+  border-color: rgba(255, 122, 26, 0.35);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.card-box {
+  @apply rounded-xl border border-white/10 bg-white/5 px-4 py-3 text-sm transition;
+}
+
+.card-box:hover {
+  border-color: rgba(255, 122, 26, 0.3);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.table-base {
+  @apply min-w-full text-left;
+}
+
+.table-base thead {
+  @apply bg-white/5 text-xs uppercase tracking-[0.2em] text-white/50;
+}
+
+.table-base th {
+  @apply px-4 py-3 font-medium;
+}
+
+.table-base td {
+  @apply px-4 py-3 text-sm text-white/80;
+}
+
+.table-base tbody tr:hover td {
+  background-color: rgba(255, 255, 255, 0.04);
+}
+
+.table-base tbody tr td {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.table-base tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.table-sm th {
+  @apply px-3 py-2 text-[10px] uppercase tracking-[0.2em] text-white/60;
+}
+
+.table-sm td {
+  @apply px-3 py-2 text-xs text-white/80;
+}
+
+.modal-backdrop {
+  @apply fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-md px-4;
+}
+
+.modal-panel {
+  @apply w-full rounded-2xl border border-white/10 bg-[var(--panel)]/95 p-6;
+  box-shadow: 0 40px 120px rgba(0, 0, 0, 0.75);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
+.kanban-column {
+  transition: border-color 0.2s ease, background 0.2s ease;
+}
+
+.kanban-column-active {
+  border-color: rgba(255, 122, 26, 0.55);
+  background: rgba(255, 122, 26, 0.08);
+}
+
+.kanban-card {
+  cursor: grab;
+  transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+}
+
+.kanban-card:active {
+  cursor: grabbing;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35);
+}
+
+.timeline {
+  position: relative;
+  display: grid;
+  gap: 12px;
+  padding-left: 18px;
+}
+
+.timeline::before {
+  content: "";
+  position: absolute;
+  left: 6px;
+  top: 4px;
+  bottom: 4px;
+  width: 2px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.timeline-item {
+  position: relative;
+  padding-left: 16px;
+}
+
+.timeline-dot {
+  position: absolute;
+  left: -2px;
+  top: 14px;
+  height: 8px;
+  width: 8px;
+  border-radius: 999px;
+  background: var(--accent);
+  box-shadow: 0 0 0 4px rgba(255, 122, 26, 0.12);
+}
+
+.scroll-soft::-webkit-scrollbar {
+  height: 8px;
+  width: 8px;
+}
+
+.scroll-soft::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 999px;
+}
+
+.scroll-soft::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 999px;
+}
+
+.kpi-card {
+  position: relative;
+  overflow: hidden;
+}
+
+.kpi-card::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(120deg, rgba(255, 122, 26, 0.2), rgba(255, 179, 106, 0.08), transparent 60%);
+  opacity: 0.9;
+  pointer-events: none;
+}
+
+.coach-card {
+  border: 1px solid rgba(255, 122, 26, 0.35);
+  background: linear-gradient(
+      120deg,
+      rgba(255, 122, 26, 0.12),
+      rgba(255, 179, 106, 0.06),
+      rgba(15, 18, 23, 0.9)
+    );
+}
+
+.badge {
+  @apply inline-flex items-center rounded-full border border-[var(--accent)]/35 bg-[var(--accent)]/15 px-2.5 py-1 text-[10px] uppercase tracking-[0.2em] text-[var(--accent-2)];
+}
+
+.chart-empty {
+  @apply flex h-full items-center justify-center rounded-xl border border-dashed border-white/10 text-sm text-[var(--muted)];
+}
+
+.skeleton {
+  position: relative;
+  overflow: hidden;
+  border-radius: 14px;
+  background: linear-gradient(120deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.03));
+}
+
+.skeleton::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(255, 255, 255, 0.15),
+    transparent
+  );
+  animation: skeleton-shimmer 1.4s infinite;
+}
+
+@keyframes skeleton-shimmer {
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+@media (max-width: 768px) {
+  .panel {
+    padding: 18px;
+  }
+
+  .modal-panel {
+    padding: 18px;
+    max-height: 90vh;
+    overflow: auto;
+  }
+
+  .card-row {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .table-base {
+    min-width: 640px;
+  }
+}

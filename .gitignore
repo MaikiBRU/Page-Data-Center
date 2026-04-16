@@ -1,0 +1,42 @@
+# Secrets
+.env
+backend/.env
+frontend/.env.local
+**/.env
+**/.env.local
+**/.env.development.local
+**/.env.test.local
+**/.env.production.local
+!**/.env.example
+
+# Dependencies
+**/node_modules/
+
+# Python
+**/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Next.js / frontend
+**/.next/
+**/out/
+**/build/
+**/coverage/
+*.tsbuildinfo
+
+# Local caches
+.npm-cache/
+frontend/.npm-cache/
+
+# Logs and generated runtime files
+logs/
+*.log
+
+# Generated uploads / local data
+data/uploads/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
