@@ -1,11 +1,4 @@
-const getBrowserApiUrl = () => {
-  if (typeof window === "undefined") return null;
-  const host = window.location.hostname || "localhost";
-  return `http://${host}:8000`;
-};
-
 export const API_URL =
-  getBrowserApiUrl() ??
   process.env.NEXT_PUBLIC_API_URL ??
   "http://localhost:8000";
 

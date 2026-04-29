@@ -21,6 +21,7 @@ frontend/.env.local
 
 # Next.js / frontend
 **/.next/
+**/.open-next/
 **/out/
 **/build/
 **/coverage/
