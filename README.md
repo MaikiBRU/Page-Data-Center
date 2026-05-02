@@ -29,39 +29,7 @@ Aplicacion full-stack para monitoreo de calidad de datos orientada a ecommerce y
 - Python 3.12+ recomendado
 - Node.js 20+
 - Docker Desktop
-
-## Variables de entorno
-
-Backend: copiar `backend/.env.example` a `backend/.env`
-
-Frontend: copiar `frontend/.env.example` a `frontend/.env.local`
-
-## Puesta en marcha
-
-1. Base de datos:
-
-```powershell
-docker compose up -d
-```
-
-2. Backend:
-
-```powershell
-python -m pip install -r requirements.txt
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
-```
-
-3. Frontend:
-
-```powershell
-npm install
-npm run dev
-```
-
-App: `http://127.0.0.1:3000`
-
-API: `http://127.0.0.1:8000`
-
+  
 ## Calidad y smoke test
 
 Frontend:
