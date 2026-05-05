@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { apiFetch, API_URL } from "@/lib/api";
 import { setToken } from "@/lib/auth";
@@ -9,6 +9,36 @@ import { emitToast } from "@/lib/toast";
 type LoginClientProps = {
   initialClientId?: string | null;
 };
+
+type GoogleCredentialResponse = {
+  credential?: string;
+};
+
+declare global {
+  interface Window {
+    google?: {
+      accounts?: {
+        id?: {
+          initialize: (options: {
+            client_id: string;
+            callback: (response: GoogleCredentialResponse) => void;
+          }) => void;
+          renderButton: (
+            parent: HTMLElement,
+            options: {
+              theme?: "outline" | "filled_blue" | "filled_black";
+              size?: "large" | "medium" | "small";
+              type?: "standard" | "icon";
+              text?: "signin_with" | "signup_with" | "continue_with" | "signin";
+              shape?: "rectangular" | "pill" | "circle" | "square";
+              width?: number;
+            }
+          ) => void;
+        };
+      };
+    };
+  }
+}
 
 export default function LoginClient({ initialClientId }: LoginClientProps) {
   const router = useRouter();
@@ -23,6 +53,7 @@ export default function LoginClient({ initialClientId }: LoginClientProps) {
   const [clientId, setClientId] = useState<string | null>(
     initialClientId && initialClientId.length > 0 ? initialClientId : null
   );
+  const googleButtonRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     const loadClientId = async () => {
@@ -81,7 +112,75 @@ export default function LoginClient({ initialClientId }: LoginClientProps) {
     fillEmail();
   }, [mode]);
 
-  const googleStartUrl = `${API_URL}/auth/google/start`;
+  useEffect(() => {
+    if (!clientId || !googleButtonRef.current) return;
+
+    const mountGoogleButton = () => {
+      if (!window.google?.accounts?.id || !googleButtonRef.current) {
+        setGoogleError("Google no está disponible en este navegador.");
+        return;
+      }
+
+      googleButtonRef.current.innerHTML = "";
+      window.google.accounts.id.initialize({
+        client_id: clientId,
+        callback: async (response) => {
+          if (!response.credential) {
+            setGoogleError("Google no devolvió una credencial válida.");
+            return;
+          }
+
+          setGoogleError(null);
+          setError(null);
+          setLoading(true);
+          try {
+            const token = await apiFetch<{
+              access_token: string;
+              needs_password_setup?: boolean;
+            }>("/auth/google", {
+              method: "POST",
+              body: JSON.stringify({ id_token: response.credential }),
+            });
+            setToken(token.access_token);
+            emitToast({ message: "Sesión iniciada con Google.", kind: "success" });
+            router.push("/dashboard");
+          } catch (err) {
+            const message = (err as Error).message;
+            setGoogleError(message);
+            emitToast({ message, kind: "error" });
+          } finally {
+            setLoading(false);
+          }
+        },
+      });
+      window.google.accounts.id.renderButton(googleButtonRef.current, {
+        theme: "outline",
+        size: "large",
+        type: "standard",
+        text: "continue_with",
+        shape: "rectangular",
+        width: 320,
+      });
+    };
+
+    if (window.google?.accounts?.id) {
+      mountGoogleButton();
+      return;
+    }
+
+    const script = document.createElement("script");
+    script.src = "https://accounts.google.com/gsi/client";
+    script.async = true;
+    script.defer = true;
+    script.onload = mountGoogleButton;
+    script.onerror = () => setGoogleError("No se pudo cargar Google.");
+    document.head.appendChild(script);
+
+    return () => {
+      script.onload = null;
+      script.onerror = null;
+    };
+  }, [clientId, router]);
 
   const handleLogin = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -242,9 +341,7 @@ export default function LoginClient({ initialClientId }: LoginClientProps) {
         )}
 
         <div className="grid gap-3">
-          <a className="btn-secondary text-center" href={googleStartUrl}>
-            Continuar con Google
-          </a>
+          <div className="flex min-h-11 justify-center" ref={googleButtonRef} />
           {googleError && <p className="text-xs text-[var(--muted)]">{googleError}</p>}
         </div>
       </form>
