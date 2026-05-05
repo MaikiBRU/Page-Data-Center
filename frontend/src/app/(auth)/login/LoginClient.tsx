@@ -154,7 +154,7 @@ export default function LoginClient({ initialClientId }: LoginClientProps) {
         },
       });
       window.google.accounts.id.renderButton(googleButtonRef.current, {
-        theme: "outline",
+        theme: "filled_black",
         size: "large",
         type: "standard",
         text: "continue_with",
