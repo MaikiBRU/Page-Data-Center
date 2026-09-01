@@ -162,33 +162,63 @@ efecto secundario es que las paginas de la aplicacion pasan a renderizarse bajo
 demanda en vez de prerenderizarse, que es lo correcto para pantallas que
 dependen de la sesion.
 
+### OpenNext no compila bien en Windows
+
+Esto costo una caida de produccion, asi que conviene tenerlo presente: el build
+nativo en Windows **termina sin errores** y wrangler sube el Worker sin
+quejarse, pero el bundle falla en tiempo de ejecucion con
+
+```
+ChunkLoadError: Failed to load chunk server/chunks/ssr/...
+```
+
+y el sitio entero devuelve 500. OpenNext lo avisa ("OpenNext is not fully
+compatible with Windows"), pero es un warning entre muchos y el fallo aparece
+despues del deploy, no durante.
+
+Por eso `npm run deploy` pasa por `scripts/deploy.mjs`, que en Windows compila
+dentro de un contenedor Linux (`node:22`) y sube ese artefacto. En Linux y
+macOS compila directo. El comando es el mismo en los tres casos.
+
 ### Desplegar
 
-Preferido, sin depender de la maquina de nadie:
+Desde `frontend/`:
+
+```powershell
+npm run deploy
+```
+
+Compila, comprueba que el bundle apunte a la API de produccion y no contenga
+localhost, despliega y verifica que `/demo` responda 200. En Windows necesita
+Docker corriendo.
+
+Alternativa sin depender de la maquina de nadie:
 
 ```
 Actions -> "Deploy frontend (Cloudflare Workers)" -> Run workflow
 ```
 
-Requiere dos secrets del repositorio (Settings > Secrets and variables >
-Actions):
+El runner es Ubuntu, asi que no tiene el problema de Windows. Requiere dos
+secrets del repositorio (Settings > Secrets and variables > Actions):
 
 | Secret | De donde sale |
 | --- | --- |
 | `CLOUDFLARE_API_TOKEN` | Cloudflare > My Profile > API Tokens, permiso `Workers Scripts: Edit` |
 | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare > Workers & Pages, panel derecho |
 
-El workflow compila, **verifica que el bundle apunte a la API de produccion y
-no contenga localhost**, despliega y comprueba que `/demo` responda 200.
+Para desplegar a mano hace falta estar autenticado: `npx wrangler login` abre el
+navegador una vez y guarda el token. Caduca cada varios meses; si `npm run
+deploy` falla con "Failed to fetch auth token", volve a correrlo.
 
-Manual, desde `frontend/`:
+`npm run deploy:raw` es el comando sin proteccion, por si alguna vez hace falta
+saltearse el contenedor. No usarlo desde Windows.
+
+### Volver atras
 
 ```powershell
-npm run deploy
+npx wrangler deployments list
+npx wrangler rollback <version-id>
 ```
-
-Funciona igual, siempre que `.env.local` no tenga una URL local; si la tiene,
-el build se detiene con instrucciones en vez de publicar algo roto.
 
 ## Verificacion
 

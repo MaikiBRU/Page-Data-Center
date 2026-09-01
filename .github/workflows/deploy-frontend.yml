@@ -65,11 +65,13 @@ jobs:
             exit 1
           fi
 
+      # El runner es Ubuntu, asi que compila nativo. El rodeo por Docker que
+      # hace `npm run deploy` solo existe para Windows.
       - name: Deploy a Cloudflare Workers
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: npm run deploy
+        run: npm run deploy:raw
 
       - name: Comprobar el sitio publicado
         run: |
