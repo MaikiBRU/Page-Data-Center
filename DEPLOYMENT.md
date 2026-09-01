@@ -144,7 +144,23 @@ El proyecto lo resuelve en dos capas:
   silencioso en un error de build con el comando de solucion en el mensaje.
 
 Para compilar a proposito un bundle de produccion contra un backend local:
-`NEXT_PUBLIC_ALLOW_LOCAL_API=1 npm run build`.
+`NEXT_PUBLIC_ALLOW_LOCAL_API=1 npm run build`. La comprobacion corre solo
+durante `next build`; `next start` arranca un build ya compilado sin volver a
+mirarla, porque a esa altura el valor ya esta horneado.
+
+### Nada de middleware
+
+`src/proxy.ts` (el nuevo nombre de `middleware.ts` en Next 16) siempre corre en
+el runtime de Node y no admite cambiarlo -- fijar `runtime` ahi lanza un error.
+OpenNext para Cloudflare no puede desplegar middleware de Node: el deploy
+fallaba con "Node.js middleware is not currently supported", de modo que el
+frontend entero era indesplegable.
+
+La guarda de rutas vive ahora en `src/app/(app)/layout.tsx`, un componente de
+servidor que lee la cookie y redirige. Mismo comportamiento, sin middleware. El
+efecto secundario es que las paginas de la aplicacion pasan a renderizarse bajo
+demanda en vez de prerenderizarse, que es lo correcto para pantallas que
+dependen de la sesion.
 
 ### Desplegar
 

@@ -63,7 +63,17 @@ function assertProductionApiUrl(): void {
   }
 }
 
-if (process.env.NODE_ENV === "production" && process.env.NEXT_PHASE !== "phase-development-server") {
+// Solo durante `next build`.
+//
+// `next start` tambien carga este archivo con NODE_ENV=production, y hacerlo
+// fallar ahi impedia arrancar un build ya compilado: para entonces el valor ya
+// esta horneado, asi que revisarlo de nuevo no protege nada y solo rompe el
+// arranque.
+//
+// NEXT_PHASE seria lo natural, pero en Next 16 llega undefined cuando se carga
+// la configuracion (comprobado). El subcomando de la CLI si esta disponible.
+const esBuild = process.argv.includes("build");
+if (esBuild) {
   assertProductionApiUrl();
 }
 
