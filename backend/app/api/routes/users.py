@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, get_db, require_permission
+from app.api.deps import Principal, get_current_user, get_db, require_permission
 from app.models.user import User
 from app.models.audit_log import AuditLog
 from app.schemas.user import (
@@ -14,6 +14,10 @@ from app.schemas.user import (
 from app.services.security import get_password_hash
 
 router = APIRouter(prefix="/users", tags=["users"])
+
+# Every endpoint in this router depends on get_current_user (directly or via
+# require_permission with a non-demo role), which refuses demo tokens. User
+# administration and the audit trail are therefore unreachable from a sandbox.
 
 
 def _require_admin(current_user: User, db: Session) -> None:
@@ -76,7 +80,7 @@ def list_users(
 @router.get("/assignable")
 def list_assignable(
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_permission("users:assignable")),
+    principal: Principal = Depends(require_permission("users:assignable")),
 ):
     users = (
         db.query(User)

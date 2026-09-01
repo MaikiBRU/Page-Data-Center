@@ -93,3 +93,22 @@ class AuditLogOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class IdentityOut(BaseModel):
+    """Who the caller is, for either an application user or a demo sandbox.
+
+    The frontend reads email/role/is_admin from this and now also learns
+    whether it is running inside a sandbox, so it can switch to demo chrome
+    without a second round trip.
+    """
+
+    email: str
+    role: str
+    is_admin: bool = False
+    is_active: bool = True
+    is_demo: bool = False
+    id: int | None = None
+    is_verified: bool = True
+    token_version: int = 0
+    created_at: datetime | None = None

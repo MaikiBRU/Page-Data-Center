@@ -66,7 +66,7 @@ export default function ResetPasswordPage() {
     <div className="mx-auto grid w-full max-w-4xl gap-10 lg:grid-cols-[1fr_1fr]">
       <div className="panel flex flex-col gap-6">
         <div>
-          <p className="text-xs uppercase tracking-[0.3em] text-white/40">
+          <p className="text-xs uppercase tracking-[0.3em] text-white/55">
             Nuevo acceso
           </p>
           <h1 className="mt-3 text-3xl font-semibold">Crear nueva contraseña</h1>
@@ -75,7 +75,7 @@ export default function ResetPasswordPage() {
           </p>
         </div>
         <div className="grid gap-3 rounded-2xl border border-white/10 bg-white/5 p-5 text-sm text-white/70">
-          <p className="text-xs uppercase tracking-[0.3em] text-white/40">Condiciones</p>
+          <p className="text-xs uppercase tracking-[0.3em] text-white/55">Condiciones</p>
           <p>8+ caracteres, letras y números.</p>
           <p>El enlace vence a los 30 minutos.</p>
         </div>

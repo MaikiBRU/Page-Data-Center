@@ -5,11 +5,21 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { apiFetch, API_URL } from "@/lib/api";
 import { getToken } from "@/lib/auth";
+import { entryPath } from "@/lib/demo";
 import { emitToast } from "@/lib/toast";
-import { FlowSteps } from "@/components/FlowSteps";
+import { can } from "@/lib/permissions";
+import {
+  CASE_STATUS_ORDER,
+  SEVERITY_ORDER,
+  caseStatusLabel,
+  severityLabel,
+  severityTone,
+} from "@/lib/vocabulary";
 import { OnboardingCoach } from "@/components/OnboardingCoach";
 import { useFlowData } from "@/lib/flow";
 import { EmptyState } from "@/components/EmptyState";
+import { ErrorState } from "@/components/ErrorState";
+import { useEscapeKey } from "@/lib/useEscapeKey";
 
 interface CaseItem {
   id: number;
@@ -80,8 +90,8 @@ type CaseSummary = {
 
 type SlaStateKey = "overdue" | "due_soon" | "on_track" | "none";
 
-const statusOptions = ["backlog", "open", "in_progress", "blocked", "escalated", "resolved"];
-const severityOptions = ["high", "medium", "low"];
+const statusOptions = [...CASE_STATUS_ORDER];
+const severityOptions = [...SEVERITY_ORDER];
 const slaOptions = [4, 12, 24, 48, 72, 120, 168];
 const slaMatrix: Record<string, Record<string, number>> = {
   default: { high: 24, medium: 48, low: 72 },
@@ -136,8 +146,10 @@ export default function CasesPage() {
   const [formError, setFormError] = useState<string | null>(null);
   const [formTouched, setFormTouched] = useState(false);
   const [loadingCases, setLoadingCases] = useState(true);
+  const [casesError, setCasesError] = useState<string | null>(null);
+  const [summaryError, setSummaryError] = useState(false);
   const [loadingDatasets, setLoadingDatasets] = useState(true);
-  const canEdit = me?.is_admin || me?.role === "analyst";
+  const canEdit = can(me, "case:update");
   const [assignableUsers, setAssignableUsers] = useState<
     { id: number; email: string; role: string; is_admin: boolean }[]
   >([]);
@@ -200,18 +212,47 @@ export default function CasesPage() {
     router.replace(qs ? `/cases?${qs}` : "/cases");
   }, [statusFilter, severityFilter, datasetFilter, search, assigneeFilter, slaFilter, sort, router]);
 
+  // /users/assignable is analyst-and-up: firing it for a demo visitor only
+  // produced a 403 in their console. It waits until the role is known.
+  useEffect(() => {
+    if (!can(me, "users:assignable")) {
+      setAssignableUsers([]);
+      return;
+    }
+    apiFetch<{ id: number; email: string; role: string; is_admin: boolean }[]>(
+      "/users/assignable"
+    )
+      .then(setAssignableUsers)
+      .catch(() => setAssignableUsers([]));
+  }, [me]);
+
+  // Distinguishing "no cases" from "the request failed": the empty state
+  // used to claim the backlog was clear whenever the API was unreachable.
   const loadCases = useCallback(() => {
     setLoadingCases(true);
     apiFetch<CaseItem[]>(`/cases${queryString}`)
-      .then(setCases)
-      .catch(() => null)
+      .then((data) => {
+        setCases(data);
+        setCasesError(null);
+      })
+      .catch((err: Error) => setCasesError(err.message))
       .finally(() => setLoadingCases(false));
   }, [queryString]);
 
+  /** "-" rather than 0 whenever the figure was never actually received. */
+  const kpi = (value?: number) => (summaryError ? "—" : value ?? 0);
+
+  // A null summary used to render as five confident zeros.
   const loadSummary = useCallback(() => {
     apiFetch<CaseSummary>(`/cases/summary${queryString}`)
-      .then(setSummary)
-      .catch(() => setSummary(null));
+      .then((data) => {
+        setSummary(data);
+        setSummaryError(false);
+      })
+      .catch(() => {
+        setSummary(null);
+        setSummaryError(true);
+      });
   }, [queryString]);
 
   const loadDatasets = useCallback(() => {
@@ -242,17 +283,12 @@ export default function CasesPage() {
 
   useEffect(() => {
     if (!getToken()) {
-      router.push("/login");
+      router.push(entryPath());
       return;
     }
     apiFetch<{ is_admin: boolean; role?: string; email?: string }>("/auth/me")
       .then(setMe)
       .catch(() => setMe(null));
-    apiFetch<{ id: number; email: string; role: string; is_admin: boolean }[]>(
-      "/users/assignable"
-    )
-      .then(setAssignableUsers)
-      .catch(() => setAssignableUsers([]));
     loadDatasets();
     loadCases();
     loadSummary();
@@ -286,7 +322,7 @@ export default function CasesPage() {
     event.preventDefault();
     setFormError(null);
     setFormTouched(true);
-    const canEdit = me?.is_admin || me?.role === "analyst";
+    const canEdit = can(me, "case:update");
     if (!canEdit) {
       emitToast({ message: "No tenés permisos para crear casos.", kind: "error" });
       return;
@@ -402,7 +438,7 @@ export default function CasesPage() {
   };
 
   const runQuality = async () => {
-    const canEdit = me?.is_admin || me?.role === "analyst";
+    const canEdit = can(me, "case:update");
     if (!canEdit) {
       emitToast({ message: "No tenés permisos para ejecutar calidad.", kind: "error" });
       return;
@@ -437,7 +473,7 @@ export default function CasesPage() {
     }
   };
 
-  const statusLabel = (status: string) => status.replace("_", " ");
+  const statusLabel = caseStatusLabel;
 
   const slaState = (due?: string | null) => {
     if (!due) return { label: "Sin SLA", tone: "border-white/15 bg-white/5 text-white/60" };
@@ -804,7 +840,7 @@ export default function CasesPage() {
 
   const saveCase = async () => {
     if (!selectedCase) return;
-    const canEdit = me?.is_admin || me?.role === "analyst";
+    const canEdit = can(me, "case:update");
     if (!canEdit) {
       emitToast({ message: "No tenés permisos para editar casos.", kind: "error" });
       return;
@@ -849,7 +885,7 @@ export default function CasesPage() {
 
   const addNote = async () => {
     if (!selectedCase) return;
-    const canEdit = me?.is_admin || me?.role === "analyst";
+    const canEdit = can(me, "case:update");
     if (!canEdit) {
       emitToast({ message: "No tenés permisos para agregar notas.", kind: "error" });
       return;
@@ -870,14 +906,16 @@ export default function CasesPage() {
     }
   };
 
+  // Every overlay in the app was mouse-only; Escape now closes them.
+  useEscapeKey(Boolean(selectedCase), () => setSelectedCase(null));
+  useEscapeKey(Boolean(pendingMove), () => setPendingMove(null));
+
   return (
     <div className="flex flex-col gap-8">
       <div>
-        <p className="text-xs uppercase tracking-[0.3em] text-white/40">Casos</p>
+        <p className="text-xs uppercase tracking-[0.3em] text-white/55">Casos</p>
         <h2 className="mt-2 text-3xl font-semibold">Workflow de incidentes</h2>
       </div>
-
-      <FlowSteps flow={flow} />
 
       <OnboardingCoach
         flow={flow}
@@ -890,41 +928,41 @@ export default function CasesPage() {
         secondaryHref="#quality-run"
       />
 
-      <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
+      <section className="grid grid-cols-2 gap-3 sm:gap-4 md:grid-cols-3 xl:grid-cols-5">
         <div className="panel kpi-card">
-          <p className="text-xs uppercase tracking-[0.3em] text-white/40">Total</p>
-          <p className="mt-3 text-2xl font-semibold">{summary?.total ?? 0}</p>
+          <p className="text-xs uppercase tracking-[0.3em] text-white/55">Total</p>
+          <p className="mt-3 text-2xl font-semibold">{kpi(summary?.total)}</p>
           <p className="text-xs text-[var(--muted)]">Casos monitoreados</p>
         </div>
         <div className="panel kpi-card">
-          <p className="text-xs uppercase tracking-[0.3em] text-white/40">Abiertos</p>
-          <p className="mt-3 text-2xl font-semibold">{summary?.open ?? 0}</p>
-          <p className="text-xs text-[var(--muted)]">En workflow</p>
+          <p className="text-xs uppercase tracking-[0.3em] text-white/55">Abiertos</p>
+          <p className="mt-3 text-2xl font-semibold">{kpi(summary?.open)}</p>
+          <p className="text-xs text-[var(--muted)]">Todavía sin resolver</p>
         </div>
         <div className="panel kpi-card">
-          <p className="text-xs uppercase tracking-[0.3em] text-white/40">Vencidos</p>
+          <p className="text-xs uppercase tracking-[0.3em] text-white/55">Vencidos</p>
           <p className="mt-3 text-2xl font-semibold text-[var(--danger)]">
-            {summary?.overdue ?? 0}
+            {kpi(summary?.overdue)}
           </p>
           <p className="text-xs text-[var(--muted)]">SLA fuera de tiempo</p>
         </div>
         <div className="panel kpi-card">
-          <p className="text-xs uppercase tracking-[0.3em] text-white/40">Por vencer</p>
+          <p className="text-xs uppercase tracking-[0.3em] text-white/55">Por vencer</p>
           <p className="mt-3 text-2xl font-semibold text-[var(--warning)]">
-            {summary?.due_soon ?? 0}
+            {kpi(summary?.due_soon)}
           </p>
           <p className="text-xs text-[var(--muted)]">Próximas 24h</p>
         </div>
         <div className="panel kpi-card">
-          <p className="text-xs uppercase tracking-[0.3em] text-white/40">Sin asignar</p>
-          <p className="mt-3 text-2xl font-semibold">{summary?.unassigned ?? 0}</p>
-          <p className="text-xs text-[var(--muted)]">Necesitan owner</p>
+          <p className="text-xs uppercase tracking-[0.3em] text-white/55">Sin asignar</p>
+          <p className="mt-3 text-2xl font-semibold">{kpi(summary?.unassigned)}</p>
+          <p className="text-xs text-[var(--muted)]">Necesitan responsable</p>
         </div>
       </section>
 
       <section className="panel grid gap-4 md:grid-cols-6">
         <div className="md:col-span-2">
-          <p className="text-xs uppercase tracking-[0.3em] text-white/40">Buscar</p>
+          <p className="text-xs uppercase tracking-[0.3em] text-white/55">Buscar</p>
           <input
             className="input-base mt-2"
             placeholder="Título, resumen, recomendación"
@@ -933,7 +971,7 @@ export default function CasesPage() {
           />
         </div>
         <div>
-          <p className="text-xs uppercase tracking-[0.3em] text-white/40">Estado</p>
+          <p className="text-xs uppercase tracking-[0.3em] text-white/55">Estado</p>
           <select
             className="input-base mt-2"
             value={statusFilter}
@@ -942,13 +980,13 @@ export default function CasesPage() {
             <option value="">Todos</option>
             {statusOptions.map((status) => (
               <option key={status} value={status}>
-                {status}
+                {caseStatusLabel(status)}
               </option>
             ))}
           </select>
         </div>
         <div>
-          <p className="text-xs uppercase tracking-[0.3em] text-white/40">Severidad</p>
+          <p className="text-xs uppercase tracking-[0.3em] text-white/55">Severidad</p>
           <select
             className="input-base mt-2"
             value={severityFilter}
@@ -957,13 +995,13 @@ export default function CasesPage() {
             <option value="">Todas</option>
             {severityOptions.map((sev) => (
               <option key={sev} value={sev}>
-                {sev}
+                {severityLabel(sev)}
               </option>
             ))}
           </select>
         </div>
         <div>
-          <p className="text-xs uppercase tracking-[0.3em] text-white/40">SLA</p>
+          <p className="text-xs uppercase tracking-[0.3em] text-white/55">SLA</p>
           <select
             className="input-base mt-2"
             value={slaFilter}
@@ -977,7 +1015,7 @@ export default function CasesPage() {
           </select>
         </div>
         <div>
-          <p className="text-xs uppercase tracking-[0.3em] text-white/40">Asignado</p>
+          <p className="text-xs uppercase tracking-[0.3em] text-white/55">Asignado</p>
           <select
             className="input-base mt-2"
             value={assigneeFilter}
@@ -993,7 +1031,7 @@ export default function CasesPage() {
           </select>
         </div>
         <div>
-          <p className="text-xs uppercase tracking-[0.3em] text-white/40">Dataset</p>
+          <p className="text-xs uppercase tracking-[0.3em] text-white/55">Dataset</p>
           <select
             className="input-base mt-2"
             value={datasetFilter}
@@ -1009,7 +1047,7 @@ export default function CasesPage() {
           </select>
         </div>
         <div>
-          <p className="text-xs uppercase tracking-[0.3em] text-white/40">Orden</p>
+          <p className="text-xs uppercase tracking-[0.3em] text-white/55">Orden</p>
           <select
             className="input-base mt-2"
             value={sort}
@@ -1022,17 +1060,19 @@ export default function CasesPage() {
             <option value="oldest">Más antiguos</option>
           </select>
         </div>
-        <div className="flex items-end gap-2 md:col-span-2">
+        {/* Three equal-width buttons made "Exportar CSV" wrap onto two lines,
+            so it stood taller than its neighbours. */}
+        <div className="flex flex-wrap items-end gap-2 md:col-span-2">
           {me?.email && (
             <button
-              className="btn-secondary w-full"
+              className="btn-secondary flex-1 whitespace-nowrap"
               onClick={() => setAssigneeFilter(me.email ?? "")}
             >
               Mis casos
             </button>
           )}
           <button
-            className="btn-secondary w-full"
+            className="btn-secondary flex-1 whitespace-nowrap"
             onClick={() => {
               setStatusFilter("");
               setSeverityFilter("");
@@ -1045,16 +1085,534 @@ export default function CasesPage() {
           >
             Limpiar
           </button>
-          <button className="btn-secondary w-full" onClick={() => exportCases("csv")}>
+          <button
+            className="btn-secondary flex-1 whitespace-nowrap"
+            onClick={() => exportCases("csv")}
+          >
             Exportar CSV
           </button>
         </div>
       </section>
 
+
+      <section className="grid gap-4 lg:grid-cols-[1.2fr_1fr]">
+        <div className="panel min-w-0">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-xs uppercase tracking-[0.3em] text-white/55">SLA</p>
+              <h3 className="mt-2 text-xl font-semibold">Heatmap por severidad</h3>
+              <p className="mt-1 text-xs text-[var(--muted)]">
+                Vencidos, por vencer y en plazo por severidad.
+              </p>
+            </div>
+          </div>
+          <div className="mt-4 grid gap-3">
+            {(["high", "medium", "low"] as const).map((sev) => (
+              /* A fixed 90px label column plus four padded cells needed 429px,
+                 so at 375px the page scrolled sideways. Below sm the label sits
+                 on its own line and the cells go two-up; sm:contents dissolves
+                 the wrapper so the original five-column row returns. */
+              <div key={sev} className="grid gap-2 sm:grid-cols-[84px_repeat(4,1fr)] sm:items-center">
+                <span className="text-xs uppercase tracking-[0.2em] text-white/55">{severityLabel(sev)}</span>
+                <div className="grid grid-cols-2 gap-2 sm:contents">
+                {(["overdue", "due_soon", "on_track", "none"] as const).map((key) => {
+                  const count = heatmap.data[sev][key];
+                  const intensity = Math.max(0.1, count / heatmap.max);
+                  const tone =
+                    key === "overdue"
+                      ? "var(--danger)"
+                      : key === "due_soon"
+                      ? "var(--warning)"
+                      : key === "on_track"
+                      ? "var(--success)"
+                      : "rgba(255,255,255,0.25)";
+                  return (
+                    <div
+                      key={`${sev}-${key}`}
+                      className="rounded-xl border border-white/10 px-3 py-2 text-xs"
+                      style={{
+                        background: `linear-gradient(120deg, ${tone} ${intensity * 12}%, rgba(255,255,255,0.04))`,
+                      }}
+                    >
+                      {/* Label and count used to sit on one row with
+                          justify-between, so "En plazo" wrapped and collided
+                          with its own number. Stacked, the cell always fits. */}
+                      <p className="text-base font-semibold leading-none text-white">
+                        {count}
+                      </p>
+                      <p className="mt-1 truncate text-[11px] leading-tight text-white/70">
+                        {key === "overdue"
+                          ? "Vencidos"
+                          : key === "due_soon"
+                          ? "Pronto"
+                          : key === "on_track"
+                          ? "En plazo"
+                          : "Sin SLA"}
+                      </p>
+                    </div>
+                  );
+                })}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="panel min-w-0">
+          <div>
+            <p className="text-xs uppercase tracking-[0.3em] text-white/55">Usuarios</p>
+            <h3 className="mt-2 text-xl font-semibold">Métricas por responsable</h3>
+            <p className="mt-1 text-xs text-[var(--muted)]">
+              Distribución de casos y SLA por responsable.
+            </p>
+          </div>
+          <div className="scroll-soft mt-4 overflow-x-auto rounded-2xl border border-white/10">
+            <table className="table-base text-sm">
+              <thead>
+                <tr>
+                  <th className="px-4 py-3">Responsable</th>
+                  <th className="px-4 py-3">Total</th>
+                  <th className="px-4 py-3">Abiertos</th>
+                  <th className="px-4 py-3">Vencidos</th>
+                  <th className="px-4 py-3">Por vencer</th>
+                </tr>
+              </thead>
+              <tbody>
+                {metricsByUser.length === 0 ? (
+                  <tr>
+                    <td colSpan={5} className="px-4 py-6 text-center text-sm text-[var(--muted)]">
+                      No hay datos para mostrar.
+                    </td>
+                  </tr>
+                ) : (
+                  metricsByUser.map((row) => (
+                    <tr key={row.assignee}>
+                      <td className="px-4 py-3">
+                        <div className="flex items-center gap-2">
+                          <span>{row.assignee}</span>
+                          {row.assignee === leastLoadedAssignee && (
+                            <span className="badge">Sugerido</span>
+                          )}
+                        </div>
+                      </td>
+                      <td className="px-4 py-3 text-white/70">{row.total}</td>
+                      <td className="px-4 py-3 text-white/70">{row.open}</td>
+                      <td className="px-4 py-3 text-[var(--danger)]">{row.overdue}</td>
+                      <td className="px-4 py-3 text-[var(--warning)]">{row.dueSoon}</td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section className="panel">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <p className="text-xs uppercase tracking-[0.3em] text-white/55">Prioridades</p>
+            <h3 className="mt-2 text-xl font-semibold">SLA más críticos</h3>
+            <p className="mt-1 text-xs text-[var(--muted)]">
+              Los próximos a vencer o vencidos según deadline.
+            </p>
+          </div>
+          <button className="btn-secondary" onClick={() => setSlaFilter("due_soon")}>
+            Ver por vencer
+          </button>
+        </div>
+        <div className="mt-4 grid gap-3 md:grid-cols-2">
+          {slaPriority.length === 0 ? (
+            <EmptyState
+              title="No hay SLA críticos."
+              description="Cuando existan casos cercanos al vencimiento aparecerán aquí."
+              compact
+            />
+          ) : (
+            slaPriority.map((item) => (
+              <div key={item.id} className="card-box">
+                <div className="flex items-center justify-between text-xs text-white/50">
+                  <span>#{item.id}</span>
+                  <span className={`badge ${slaState(item.due_date).tone}`}>
+                    {slaState(item.due_date).label}
+                  </span>
+                </div>
+                <p className="mt-2 text-sm font-medium">{item.title}</p>
+                <p className="text-xs text-[var(--muted)]">
+                  {datasetMap.get(item.dataset_id)?.name ?? `#${item.dataset_id}`}
+                </p>
+                <p className="mt-2 text-xs text-white/60">
+                  {formatRelative(item.due_date)} · {formatDate(item.due_date)}
+                </p>
+                <div className="mt-2 flex gap-2">
+                  <button className="btn-mini" onClick={() => openCase(item.id)}>
+                    Abrir
+                  </button>
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      </section>
+
+      <section className="panel">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <p className="text-xs uppercase tracking-[0.3em] text-white/55">Backlog</p>
+            <h3 className="mt-2 text-xl font-semibold">
+              {cases.length} casos encontrados
+            </h3>
+            <p className="text-xs text-[var(--muted)]">
+              Edad promedio: {kpi(summary?.avg_age_hours)}h · SLA restante:{" "}
+              {kpi(summary?.avg_sla_remaining_hours)}h
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              className={viewMode === "list" ? "btn-primary" : "btn-secondary"}
+              onClick={() => setViewMode("list")}
+            >
+              Lista
+            </button>
+            <button
+              className={viewMode === "kanban" ? "btn-primary" : "btn-secondary"}
+              onClick={() => setViewMode("kanban")}
+            >
+              Kanban
+            </button>
+            <button className="btn-secondary" onClick={() => exportCases("json")}>
+              Exportar JSON
+            </button>
+            <button className="btn-secondary" onClick={() => exportCases("csv")}>
+              Exportar CSV
+            </button>
+          </div>
+        </div>
+
+        <div className="mt-4 grid gap-3 rounded-2xl border border-white/10 bg-white/5 p-4 text-sm">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <label className="flex items-center gap-2 text-xs text-white/70">
+              <input
+                type="checkbox"
+                className="h-4 w-4 accent-[var(--accent)]"
+              checked={cases.length > 0 && selectedCount === cases.length}
+                onChange={(event) => toggleSelectAll(event.target.checked)}
+              />
+              Seleccionar todo
+            </label>
+            <div className="text-xs text-white/60">
+              Seleccionados: {selectedCount}
+            </div>
+          </div>
+          <div className="grid gap-3 md:grid-cols-[1fr_1fr_1fr_auto_auto]">
+            <select
+              className="input-base"
+              value={bulkStatus}
+              onChange={(event) => setBulkStatus(event.target.value)}
+              disabled={!canEdit}
+            >
+              <option value="">Cambiar estado…</option>
+              {statusOptions.map((status) => (
+                <option key={status} value={status}>
+                  {caseStatusLabel(status)}
+                </option>
+              ))}
+            </select>
+            <select
+              className="input-base"
+              value={bulkAssignee}
+              onChange={(event) => setBulkAssignee(event.target.value)}
+              disabled={!canEdit}
+            >
+              <option value="">Asignar a…</option>
+              <option value="__none__">Quitar asignación</option>
+              {assignableUsers.map((user) => (
+                <option key={user.id} value={user.email}>
+                  {user.email}
+                </option>
+              ))}
+            </select>
+            <select
+              className="input-base"
+              value={bulkSla}
+              onChange={(event) =>
+                setBulkSla(event.target.value ? Number(event.target.value) : "")
+              }
+              disabled={!canEdit}
+            >
+              <option value="">SLA rápido…</option>
+              {slaOptions.map((hours) => (
+                <option key={hours} value={hours}>
+                  {hours} horas
+                </option>
+              ))}
+            </select>
+            <button
+              className="btn-primary"
+              onClick={applyBulk}
+              disabled={bulkUpdating || !canEdit}
+            >
+              {bulkUpdating ? "Aplicando..." : "Aplicar"}
+            </button>
+            <button
+              className="btn-secondary"
+              onClick={autoAssignSelected}
+              disabled={bulkUpdating || !canEdit}
+            >
+              Auto-asignar
+            </button>
+          </div>
+          {!canEdit && (
+            <p className="text-xs text-[var(--muted)]">
+              Solo administradores o analistas pueden editar casos.
+            </p>
+          )}
+        </div>
+
+        {viewMode === "list" ? (
+          <div className="mt-6 grid gap-3">
+            {loadingCases ? (
+              Array.from({ length: 3 }).map((_, index) => (
+                <div key={`case-skel-${index}`} className="skeleton h-16" />
+              ))
+          ) : casesError ? (
+            <ErrorState message={casesError} onRetry={loadCases} />
+          ) : cases.length === 0 ? (
+            <EmptyState
+              title="Sin casos encontrados."
+              description="Ejecutá una corrida o creá un caso manual para comenzar."
+              actions={
+                canEdit
+                  ? [
+                      { label: "Ejecutar calidad", href: "#quality-run", variant: "secondary" },
+                      { label: "Crear caso manual", href: "#manual-case", variant: "primary" },
+                    ]
+                  : []
+              }
+            />
+          ) : (
+              cases.map((item) => {
+                const datasetName = datasetMap.get(item.dataset_id)?.name ?? `#${item.dataset_id}`;
+                const due = slaState(item.due_date);
+                const progress = slaProgress(item);
+                return (
+                  <div
+                    key={item.id}
+                    className="card-row cursor-pointer"
+                    onClick={() => openCase(item.id)}
+                  >
+                    <div className="flex items-start gap-3">
+                      <input
+                        type="checkbox"
+                        className="mt-1 h-4 w-4 accent-[var(--accent)]"
+                        checked={Boolean(selectedIds[item.id])}
+                        onClick={(event) => event.stopPropagation()}
+                        onChange={(event) =>
+                          setSelectedIds((prev) => ({
+                            ...prev,
+                            [item.id]: event.target.checked,
+                          }))
+                        }
+                      />
+                      <div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <p className="font-medium">{item.title}</p>
+                          <span className="text-xs text-white/55">#{item.id}</span>
+                        </div>
+                        <p className="text-xs text-[var(--muted)]">
+                          Dataset: {datasetName}
+                        </p>
+                        {item.assignee && (
+                          <p className="mt-1 text-xs text-[var(--muted)]">
+                            Asignado a: {item.assignee}
+                          </p>
+                        )}
+                        {item.status === "blocked" && item.blocked_reason && (
+                          <p className="mt-1 text-xs text-[var(--warning)]">
+                            Bloqueado: {item.blocked_reason}
+                          </p>
+                        )}
+                        {item.status === "blocked" && item.blocked_until && (
+                          <p className="mt-1 text-xs text-[var(--muted)]">
+                            Revisión: {formatDate(item.blocked_until)}
+                          </p>
+                        )}
+                        {item.status === "escalated" && (
+                          <p className="mt-1 text-xs text-[var(--warning)]">
+                            Escalado nivel {item.escalated_level ?? 1}
+                            {item.escalated_to ? ` → ${item.escalated_to}` : ""}
+                          </p>
+                        )}
+                        <p className="mt-1 text-xs text-white/50">{formatRelative(item.due_date)}</p>
+                        {progress !== null && (
+                          <div className="mt-2 h-1.5 w-full rounded-full bg-white/10">
+                            <div
+                              className="h-1.5 rounded-full bg-[var(--accent)]"
+                              style={{ width: `${progress}%` }}
+                            />
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                    <div className="flex flex-col items-end gap-2 text-xs">
+                      <div className="flex items-center gap-2">
+                        <span className={`badge ${statusBadge(item.status)}`}>
+                          {statusLabel(item.status)}
+                        </span>
+                        <span className={`badge ${severityTone(item.severity)}`}>
+                          {severityLabel(item.severity)}
+                        </span>
+                        <span className={`badge ${due.tone}`}>{due.label}</span>
+                      </div>
+                      <div className="text-xs text-white/50">
+                        {item.due_date ? `Deadline ${formatDate(item.due_date)}` : "Sin SLA"}
+                      </div>
+                      <select
+                        className="input-base w-40 text-xs"
+                        value={item.assignee ?? ""}
+                        onClick={(event) => event.stopPropagation()}
+                        onChange={(event) =>
+                          assignCase(item.id, event.target.value ? event.target.value : null)
+                        }
+                        disabled={!canEdit}
+                      >
+                        <option value="">Sin asignar</option>
+                        {assignableUsers.map((user) => (
+                          <option key={user.id} value={user.email}>
+                            {user.email}
+                          </option>
+                        ))}
+                      </select>
+                      <div className="flex gap-2">
+                        {me?.email && (
+                          <button
+                            className="btn-mini"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              setSelectedIds((prev) => ({ ...prev, [item.id]: true }));
+                              setBulkAssignee(me.email ?? "");
+                            }}
+                          >
+                            Asignarme
+                          </button>
+                        )}
+                        <button
+                          className="btn-mini"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            openCase(item.id);
+                          }}
+                        >
+                          Abrir
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        ) : (
+          <div className="mt-6 grid gap-4 overflow-x-auto lg:grid-cols-6">
+            {statusOptions.map((status) => {
+              const column = cases.filter((item) => item.status === status);
+              return (
+                <div
+                  key={status}
+                  className={`kanban-column min-w-[220px] rounded-2xl border border-white/10 bg-white/5 p-3 ${
+                    dragOverStatus === status ? "kanban-column-active" : ""
+                  }`}
+                  onDragOver={(event) => {
+                    if (!canEdit) return;
+                    event.preventDefault();
+                    setDragOverStatus(status);
+                  }}
+                  onDragLeave={() => setDragOverStatus(null)}
+                  onDrop={(event) => {
+                    if (!canEdit) return;
+                    event.preventDefault();
+                    if (draggingId) {
+                      const current = cases.find((item) => item.id === draggingId);
+                      if (current && current.status !== status) {
+                        setPendingMove({ id: draggingId, from: current.status, to: status });
+                      }
+                    }
+                    setDragOverStatus(null);
+                    setDraggingId(null);
+                  }}
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs uppercase tracking-[0.2em] text-white/50">
+                      {statusLabel(status)}
+                    </span>
+                    <span className="text-xs text-white/60">{column.length}</span>
+                  </div>
+                  <div className="mt-3 grid gap-3">
+                    {column.length === 0 ? (
+                      <EmptyState
+                        title="Sin casos"
+                        description="Mové un caso o creá uno manual."
+                        compact
+                      />
+                    ) : (
+                      column.map((item) => {
+                        const due = slaState(item.due_date);
+                        return (
+                          <button
+                            key={item.id}
+                            className={`card-box text-left kanban-card ${
+                              draggingId === item.id ? "opacity-60 scale-[0.98]" : ""
+                            }`}
+                            onClick={() => openCase(item.id)}
+                            draggable={canEdit}
+                            onDragStart={() => canEdit && setDraggingId(item.id)}
+                            onDragEnd={() => setDraggingId(null)}
+                          >
+                            <div className="flex items-center justify-between text-xs text-white/50">
+                              <span>#{item.id}</span>
+                              <span className={`badge ${due.tone}`}>{due.label}</span>
+                            </div>
+                            <p className="mt-2 text-sm font-medium">{item.title}</p>
+                            <p className="mt-1 text-xs text-[var(--muted)]">
+                              {datasetMap.get(item.dataset_id)?.name ?? `#${item.dataset_id}`}
+                            </p>
+                            {item.status === "blocked" && item.blocked_reason && (
+                              <p className="mt-1 text-xs text-[var(--warning)]">
+                                Bloqueado: {item.blocked_reason}
+                              </p>
+                            )}
+                            {item.status === "escalated" && (
+                              <p className="mt-1 text-xs text-[var(--warning)]">
+                                Escalado nivel {item.escalated_level ?? 1}
+                              </p>
+                            )}
+                            <p className="mt-1 text-xs text-white/50">
+                              {formatRelative(item.due_date)}
+                            </p>
+                            <div className="mt-2 flex items-center gap-2 text-xs">
+                              <span className={`badge ${severityTone(item.severity)}`}>
+                                {severityLabel(item.severity)}
+                              </span>
+                              {item.assignee && (
+                                <span className="text-white/50">{item.assignee}</span>
+                              )}
+                            </div>
+                          </button>
+                        );
+                      })
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </section>
+
       <section className="grid gap-4 lg:grid-cols-[1fr_1.4fr]">
         <div className="panel flex flex-col gap-4">
           <div>
-            <p className="text-xs uppercase tracking-[0.3em] text-white/40">Opción 1</p>
+            <p className="text-xs uppercase tracking-[0.3em] text-white/55">Opción 1</p>
             <h3 className="mt-2 text-xl font-semibold">Corrida de calidad</h3>
             <p className="mt-2 text-sm text-[var(--muted)]">
               Ejecuta reglas y anomalías para generar casos automáticamente.
@@ -1103,7 +1661,7 @@ export default function CasesPage() {
 
         <form onSubmit={createCase} className="panel grid gap-4" id="manual-case">
           <div>
-            <p className="text-xs uppercase tracking-[0.3em] text-white/40">Opción 2</p>
+            <p className="text-xs uppercase tracking-[0.3em] text-white/55">Opción 2</p>
             <div className="mt-2 flex items-center gap-3">
               <h3 className="text-xl font-semibold">Crear caso manual</h3>
               {isFormValid() && (
@@ -1188,7 +1746,7 @@ export default function CasesPage() {
               >
                 {severityOptions.map((severity) => (
                   <option key={severity} value={severity}>
-                    {severity}
+                    {severityLabel(severity)}
                   </option>
                 ))}
               </select>
@@ -1203,7 +1761,7 @@ export default function CasesPage() {
               >
                 {statusOptions.map((status) => (
                   <option key={status} value={status}>
-                    {status}
+                    {caseStatusLabel(status)}
                   </option>
                 ))}
               </select>
@@ -1436,512 +1994,9 @@ export default function CasesPage() {
         </form>
       </section>
 
-      <section className="grid gap-4 lg:grid-cols-[1.2fr_1fr]">
-        <div className="panel">
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="text-xs uppercase tracking-[0.3em] text-white/40">SLA</p>
-              <h3 className="mt-2 text-lg font-semibold">Heatmap por severidad</h3>
-              <p className="mt-1 text-xs text-[var(--muted)]">
-                Vencidos, por vencer y en plazo por severidad.
-              </p>
-            </div>
-          </div>
-          <div className="mt-4 grid gap-3">
-            {(["high", "medium", "low"] as const).map((sev) => (
-              <div key={sev} className="grid grid-cols-[90px_repeat(4,1fr)] items-center gap-2">
-                <span className="text-xs uppercase tracking-[0.2em] text-white/50">{sev}</span>
-                {(["overdue", "due_soon", "on_track", "none"] as const).map((key) => {
-                  const count = heatmap.data[sev][key];
-                  const intensity = Math.max(0.1, count / heatmap.max);
-                  const tone =
-                    key === "overdue"
-                      ? "var(--danger)"
-                      : key === "due_soon"
-                      ? "var(--warning)"
-                      : key === "on_track"
-                      ? "var(--success)"
-                      : "rgba(255,255,255,0.25)";
-                  return (
-                    <div
-                      key={`${sev}-${key}`}
-                      className="rounded-xl border border-white/10 px-3 py-2 text-xs"
-                      style={{
-                        background: `linear-gradient(120deg, ${tone} ${intensity * 12}%, rgba(255,255,255,0.04))`,
-                      }}
-                    >
-                      <div className="flex items-center justify-between text-white/80">
-                        <span>
-                          {key === "overdue"
-                            ? "Vencidos"
-                            : key === "due_soon"
-                            ? "Pronto"
-                            : key === "on_track"
-                            ? "En plazo"
-                            : "Sin SLA"}
-                        </span>
-                        <span>{count}</span>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            ))}
-          </div>
-        </div>
-
-        <div className="panel">
-          <div>
-            <p className="text-xs uppercase tracking-[0.3em] text-white/40">Usuarios</p>
-            <h3 className="mt-2 text-lg font-semibold">Métricas por owner</h3>
-            <p className="mt-1 text-xs text-[var(--muted)]">
-              Distribución de casos y SLA por responsable.
-            </p>
-          </div>
-          <div className="mt-4 overflow-hidden rounded-2xl border border-white/10">
-            <table className="table-base text-sm">
-              <thead>
-                <tr>
-                  <th className="px-4 py-3">Responsable</th>
-                  <th className="px-4 py-3">Total</th>
-                  <th className="px-4 py-3">Abiertos</th>
-                  <th className="px-4 py-3">Vencidos</th>
-                  <th className="px-4 py-3">Por vencer</th>
-                </tr>
-              </thead>
-              <tbody>
-                {metricsByUser.length === 0 ? (
-                  <tr>
-                    <td colSpan={5} className="px-4 py-6 text-center text-sm text-[var(--muted)]">
-                      No hay datos para mostrar.
-                    </td>
-                  </tr>
-                ) : (
-                  metricsByUser.map((row) => (
-                    <tr key={row.assignee}>
-                      <td className="px-4 py-3">
-                        <div className="flex items-center gap-2">
-                          <span>{row.assignee}</span>
-                          {row.assignee === leastLoadedAssignee && (
-                            <span className="badge">Sugerido</span>
-                          )}
-                        </div>
-                      </td>
-                      <td className="px-4 py-3 text-white/70">{row.total}</td>
-                      <td className="px-4 py-3 text-white/70">{row.open}</td>
-                      <td className="px-4 py-3 text-[var(--danger)]">{row.overdue}</td>
-                      <td className="px-4 py-3 text-[var(--warning)]">{row.dueSoon}</td>
-                    </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      </section>
-
-      <section className="panel">
-        <div className="flex items-center justify-between gap-3">
-          <div>
-            <p className="text-xs uppercase tracking-[0.3em] text-white/40">Prioridades</p>
-            <h3 className="mt-2 text-lg font-semibold">SLA más críticos</h3>
-            <p className="mt-1 text-xs text-[var(--muted)]">
-              Los próximos a vencer o vencidos según deadline.
-            </p>
-          </div>
-          <button className="btn-secondary" onClick={() => setSlaFilter("due_soon")}>
-            Ver por vencer
-          </button>
-        </div>
-        <div className="mt-4 grid gap-3 md:grid-cols-2">
-          {slaPriority.length === 0 ? (
-            <EmptyState
-              title="No hay SLA críticos."
-              description="Cuando existan casos cercanos al vencimiento aparecerán aquí."
-              compact
-            />
-          ) : (
-            slaPriority.map((item) => (
-              <div key={item.id} className="card-box">
-                <div className="flex items-center justify-between text-xs text-white/50">
-                  <span>#{item.id}</span>
-                  <span className={`badge ${slaState(item.due_date).tone}`}>
-                    {slaState(item.due_date).label}
-                  </span>
-                </div>
-                <p className="mt-2 text-sm font-medium">{item.title}</p>
-                <p className="text-xs text-[var(--muted)]">
-                  {datasetMap.get(item.dataset_id)?.name ?? `#${item.dataset_id}`}
-                </p>
-                <p className="mt-2 text-xs text-white/60">
-                  {formatRelative(item.due_date)} · {formatDate(item.due_date)}
-                </p>
-                <div className="mt-2 flex gap-2">
-                  <button className="btn-mini" onClick={() => openCase(item.id)}>
-                    Abrir
-                  </button>
-                </div>
-              </div>
-            ))
-          )}
-        </div>
-      </section>
-
-      <section className="panel">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <p className="text-xs uppercase tracking-[0.3em] text-white/40">Backlog</p>
-            <h3 className="mt-2 text-lg font-semibold">
-              {cases.length} casos encontrados
-            </h3>
-            <p className="text-xs text-[var(--muted)]">
-              Edad promedio: {summary?.avg_age_hours ?? 0}h · SLA restante:{" "}
-              {summary?.avg_sla_remaining_hours ?? 0}h
-            </p>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <button
-              className={viewMode === "list" ? "btn-primary" : "btn-secondary"}
-              onClick={() => setViewMode("list")}
-            >
-              Lista
-            </button>
-            <button
-              className={viewMode === "kanban" ? "btn-primary" : "btn-secondary"}
-              onClick={() => setViewMode("kanban")}
-            >
-              Kanban
-            </button>
-            <button className="btn-secondary" onClick={() => exportCases("json")}>
-              Exportar JSON
-            </button>
-            <button className="btn-secondary" onClick={() => exportCases("csv")}>
-              Exportar CSV
-            </button>
-          </div>
-        </div>
-
-        <div className="mt-4 grid gap-3 rounded-2xl border border-white/10 bg-white/5 p-4 text-sm">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <label className="flex items-center gap-2 text-xs text-white/70">
-              <input
-                type="checkbox"
-                className="h-4 w-4 accent-[var(--accent)]"
-              checked={cases.length > 0 && selectedCount === cases.length}
-                onChange={(event) => toggleSelectAll(event.target.checked)}
-              />
-              Seleccionar todo
-            </label>
-            <div className="text-xs text-white/60">
-              Seleccionados: {selectedCount}
-            </div>
-          </div>
-          <div className="grid gap-3 md:grid-cols-[1fr_1fr_1fr_auto_auto]">
-            <select
-              className="input-base"
-              value={bulkStatus}
-              onChange={(event) => setBulkStatus(event.target.value)}
-              disabled={!canEdit}
-            >
-              <option value="">Cambiar estado…</option>
-              {statusOptions.map((status) => (
-                <option key={status} value={status}>
-                  {status}
-                </option>
-              ))}
-            </select>
-            <select
-              className="input-base"
-              value={bulkAssignee}
-              onChange={(event) => setBulkAssignee(event.target.value)}
-              disabled={!canEdit}
-            >
-              <option value="">Asignar a…</option>
-              <option value="__none__">Quitar asignación</option>
-              {assignableUsers.map((user) => (
-                <option key={user.id} value={user.email}>
-                  {user.email}
-                </option>
-              ))}
-            </select>
-            <select
-              className="input-base"
-              value={bulkSla}
-              onChange={(event) =>
-                setBulkSla(event.target.value ? Number(event.target.value) : "")
-              }
-              disabled={!canEdit}
-            >
-              <option value="">SLA rápido…</option>
-              {slaOptions.map((hours) => (
-                <option key={hours} value={hours}>
-                  {hours} horas
-                </option>
-              ))}
-            </select>
-            <button
-              className="btn-primary"
-              onClick={applyBulk}
-              disabled={bulkUpdating || !canEdit}
-            >
-              {bulkUpdating ? "Aplicando..." : "Aplicar"}
-            </button>
-            <button
-              className="btn-secondary"
-              onClick={autoAssignSelected}
-              disabled={bulkUpdating || !canEdit}
-            >
-              Auto-asignar
-            </button>
-          </div>
-          {!canEdit && (
-            <p className="text-xs text-[var(--muted)]">
-              Solo administradores o analistas pueden editar casos.
-            </p>
-          )}
-        </div>
-
-        {viewMode === "list" ? (
-          <div className="mt-6 grid gap-3">
-            {loadingCases ? (
-              Array.from({ length: 3 }).map((_, index) => (
-                <div key={`case-skel-${index}`} className="skeleton h-16" />
-              ))
-          ) : cases.length === 0 ? (
-            <EmptyState
-              title="Sin casos encontrados."
-              description="Ejecutá una corrida o creá un caso manual para comenzar."
-              actions={
-                canEdit
-                  ? [
-                      { label: "Ejecutar calidad", href: "#quality-run", variant: "secondary" },
-                      { label: "Crear caso manual", href: "#manual-case", variant: "primary" },
-                    ]
-                  : []
-              }
-            />
-          ) : (
-              cases.map((item) => {
-                const datasetName = datasetMap.get(item.dataset_id)?.name ?? `#${item.dataset_id}`;
-                const due = slaState(item.due_date);
-                const progress = slaProgress(item);
-                return (
-                  <div
-                    key={item.id}
-                    className="card-row cursor-pointer"
-                    onClick={() => openCase(item.id)}
-                  >
-                    <div className="flex items-start gap-3">
-                      <input
-                        type="checkbox"
-                        className="mt-1 h-4 w-4 accent-[var(--accent)]"
-                        checked={Boolean(selectedIds[item.id])}
-                        onClick={(event) => event.stopPropagation()}
-                        onChange={(event) =>
-                          setSelectedIds((prev) => ({
-                            ...prev,
-                            [item.id]: event.target.checked,
-                          }))
-                        }
-                      />
-                      <div>
-                        <div className="flex flex-wrap items-center gap-2">
-                          <p className="font-medium">{item.title}</p>
-                          <span className="text-xs text-white/40">#{item.id}</span>
-                        </div>
-                        <p className="text-xs text-[var(--muted)]">
-                          Dataset: {datasetName}
-                        </p>
-                        {item.assignee && (
-                          <p className="mt-1 text-xs text-[var(--muted)]">
-                            Asignado a: {item.assignee}
-                          </p>
-                        )}
-                        {item.status === "blocked" && item.blocked_reason && (
-                          <p className="mt-1 text-xs text-[var(--warning)]">
-                            Bloqueado: {item.blocked_reason}
-                          </p>
-                        )}
-                        {item.status === "blocked" && item.blocked_until && (
-                          <p className="mt-1 text-xs text-[var(--muted)]">
-                            Revisión: {formatDate(item.blocked_until)}
-                          </p>
-                        )}
-                        {item.status === "escalated" && (
-                          <p className="mt-1 text-xs text-[var(--warning)]">
-                            Escalado nivel {item.escalated_level ?? 1}
-                            {item.escalated_to ? ` → ${item.escalated_to}` : ""}
-                          </p>
-                        )}
-                        <p className="mt-1 text-xs text-white/50">{formatRelative(item.due_date)}</p>
-                        {progress !== null && (
-                          <div className="mt-2 h-1.5 w-full rounded-full bg-white/10">
-                            <div
-                              className="h-1.5 rounded-full bg-[var(--accent)]"
-                              style={{ width: `${progress}%` }}
-                            />
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                    <div className="flex flex-col items-end gap-2 text-xs">
-                      <div className="flex items-center gap-2">
-                        <span className={`badge ${statusBadge(item.status)}`}>
-                          {statusLabel(item.status)}
-                        </span>
-                        <span className="rounded-full border border-white/15 bg-white/5 px-2 py-0.5 text-white/70">
-                          {item.severity}
-                        </span>
-                        <span className={`badge ${due.tone}`}>{due.label}</span>
-                      </div>
-                      <div className="text-xs text-white/50">
-                        {item.due_date ? `Deadline ${formatDate(item.due_date)}` : "Sin SLA"}
-                      </div>
-                      <select
-                        className="input-base h-8 w-40 text-xs"
-                        value={item.assignee ?? ""}
-                        onClick={(event) => event.stopPropagation()}
-                        onChange={(event) =>
-                          assignCase(item.id, event.target.value ? event.target.value : null)
-                        }
-                        disabled={!canEdit}
-                      >
-                        <option value="">Sin asignar</option>
-                        {assignableUsers.map((user) => (
-                          <option key={user.id} value={user.email}>
-                            {user.email}
-                          </option>
-                        ))}
-                      </select>
-                      <div className="flex gap-2">
-                        {me?.email && (
-                          <button
-                            className="btn-mini"
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              setSelectedIds((prev) => ({ ...prev, [item.id]: true }));
-                              setBulkAssignee(me.email ?? "");
-                            }}
-                          >
-                            Asignarme
-                          </button>
-                        )}
-                        <button
-                          className="btn-mini"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            openCase(item.id);
-                          }}
-                        >
-                          Abrir
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                );
-              })
-            )}
-          </div>
-        ) : (
-          <div className="mt-6 grid gap-4 overflow-x-auto lg:grid-cols-6">
-            {statusOptions.map((status) => {
-              const column = cases.filter((item) => item.status === status);
-              return (
-                <div
-                  key={status}
-                  className={`kanban-column min-w-[220px] rounded-2xl border border-white/10 bg-white/5 p-3 ${
-                    dragOverStatus === status ? "kanban-column-active" : ""
-                  }`}
-                  onDragOver={(event) => {
-                    if (!canEdit) return;
-                    event.preventDefault();
-                    setDragOverStatus(status);
-                  }}
-                  onDragLeave={() => setDragOverStatus(null)}
-                  onDrop={(event) => {
-                    if (!canEdit) return;
-                    event.preventDefault();
-                    if (draggingId) {
-                      const current = cases.find((item) => item.id === draggingId);
-                      if (current && current.status !== status) {
-                        setPendingMove({ id: draggingId, from: current.status, to: status });
-                      }
-                    }
-                    setDragOverStatus(null);
-                    setDraggingId(null);
-                  }}
-                >
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs uppercase tracking-[0.2em] text-white/50">
-                      {statusLabel(status)}
-                    </span>
-                    <span className="text-xs text-white/60">{column.length}</span>
-                  </div>
-                  <div className="mt-3 grid gap-3">
-                    {column.length === 0 ? (
-                      <EmptyState
-                        title="Sin casos"
-                        description="Mové un caso o creá uno manual."
-                        compact
-                      />
-                    ) : (
-                      column.map((item) => {
-                        const due = slaState(item.due_date);
-                        return (
-                          <button
-                            key={item.id}
-                            className={`card-box text-left kanban-card ${
-                              draggingId === item.id ? "opacity-60 scale-[0.98]" : ""
-                            }`}
-                            onClick={() => openCase(item.id)}
-                            draggable={canEdit}
-                            onDragStart={() => canEdit && setDraggingId(item.id)}
-                            onDragEnd={() => setDraggingId(null)}
-                          >
-                            <div className="flex items-center justify-between text-xs text-white/50">
-                              <span>#{item.id}</span>
-                              <span className={`badge ${due.tone}`}>{due.label}</span>
-                            </div>
-                            <p className="mt-2 text-sm font-medium">{item.title}</p>
-                            <p className="mt-1 text-xs text-[var(--muted)]">
-                              {datasetMap.get(item.dataset_id)?.name ?? `#${item.dataset_id}`}
-                            </p>
-                            {item.status === "blocked" && item.blocked_reason && (
-                              <p className="mt-1 text-xs text-[var(--warning)]">
-                                Bloqueado: {item.blocked_reason}
-                              </p>
-                            )}
-                            {item.status === "escalated" && (
-                              <p className="mt-1 text-xs text-[var(--warning)]">
-                                Escalado nivel {item.escalated_level ?? 1}
-                              </p>
-                            )}
-                            <p className="mt-1 text-xs text-white/50">
-                              {formatRelative(item.due_date)}
-                            </p>
-                            <div className="mt-2 flex items-center gap-2 text-xs">
-                              <span className="rounded-full border border-white/15 bg-white/5 px-2 py-0.5 text-white/70">
-                                {item.severity}
-                              </span>
-                              {item.assignee && (
-                                <span className="text-white/50">{item.assignee}</span>
-                              )}
-                            </div>
-                          </button>
-                        );
-                      })
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </section>
-
       {selectedCase && (
         <div className="modal-backdrop">
-          <div className="modal-panel relative max-h-[85vh] w-[92vw] max-w-4xl overflow-hidden">
+          <div role="dialog" aria-modal="true" className="modal-panel relative max-h-[85vh] w-[92vw] max-w-4xl overflow-hidden">
             <button
               className="absolute right-6 top-6 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-white/70"
               onClick={() => setSelectedCase(null)}
@@ -1950,7 +2005,7 @@ export default function CasesPage() {
             </button>
             <div className="scroll-soft flex flex-col gap-6 overflow-auto pr-2 max-h-[75vh]">
               <div>
-                <p className="text-xs uppercase tracking-[0.3em] text-white/40">Caso</p>
+                <p className="text-xs uppercase tracking-[0.3em] text-white/55">Caso</p>
                 <h3 className="mt-2 text-xl font-semibold">{selectedCase.title}</h3>
                 <p className="mt-2 text-sm text-[var(--muted)]">
                   Dataset{" "}
@@ -1960,7 +2015,7 @@ export default function CasesPage() {
                   >
                     {datasetMap.get(selectedCase.dataset_id)?.name ?? `#${selectedCase.dataset_id}`}
                   </Link>{" "}
-                  · {selectedCase.severity}
+                  · Severidad {severityLabel(selectedCase.severity)}
                 </p>
                 <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
                   <span className={`badge ${statusBadge(selectedCase.status)}`}>
@@ -1997,7 +2052,7 @@ export default function CasesPage() {
 
               <div className="grid gap-4 md:grid-cols-2">
                 <div>
-                  <p className="text-xs uppercase tracking-[0.3em] text-white/40">Estado</p>
+                  <p className="text-xs uppercase tracking-[0.3em] text-white/55">Estado</p>
                   <select
                     className="input-base mt-2"
                     value={selectedCase.status}
@@ -2020,13 +2075,13 @@ export default function CasesPage() {
                   >
                     {statusOptions.map((status) => (
                       <option key={status} value={status}>
-                        {status}
+                        {caseStatusLabel(status)}
                       </option>
                     ))}
                   </select>
                 </div>
                 <div>
-                  <p className="text-xs uppercase tracking-[0.3em] text-white/40">Asignado a</p>
+                  <p className="text-xs uppercase tracking-[0.3em] text-white/55">Asignado a</p>
                   <select
                     className="input-base mt-2"
                     value={selectedCase.assignee ?? ""}
@@ -2060,7 +2115,7 @@ export default function CasesPage() {
               {selectedCase.status === "blocked" && (
                 <div className="grid gap-4 md:grid-cols-2">
                   <div className="md:col-span-2">
-                    <p className="text-xs uppercase tracking-[0.3em] text-white/40">
+                    <p className="text-xs uppercase tracking-[0.3em] text-white/55">
                       Motivo de bloqueo
                     </p>
                     <textarea
@@ -2076,7 +2131,7 @@ export default function CasesPage() {
                     />
                   </div>
                   <div>
-                    <p className="text-xs uppercase tracking-[0.3em] text-white/40">
+                    <p className="text-xs uppercase tracking-[0.3em] text-white/55">
                       Revisión esperada
                     </p>
                     <input
@@ -2098,7 +2153,7 @@ export default function CasesPage() {
               {selectedCase.status === "escalated" && (
                 <div className="grid gap-4 md:grid-cols-2">
                   <div className="md:col-span-2">
-                    <p className="text-xs uppercase tracking-[0.3em] text-white/40">
+                    <p className="text-xs uppercase tracking-[0.3em] text-white/55">
                       Motivo de escalamiento
                     </p>
                     <textarea
@@ -2114,7 +2169,7 @@ export default function CasesPage() {
                     />
                   </div>
                   <div>
-                    <p className="text-xs uppercase tracking-[0.3em] text-white/40">
+                    <p className="text-xs uppercase tracking-[0.3em] text-white/55">
                       Nivel de escalamiento
                     </p>
                     <select
@@ -2134,7 +2189,7 @@ export default function CasesPage() {
                     </select>
                   </div>
                   <div>
-                    <p className="text-xs uppercase tracking-[0.3em] text-white/40">
+                    <p className="text-xs uppercase tracking-[0.3em] text-white/55">
                       Escalar a
                     </p>
                     <select
@@ -2160,7 +2215,7 @@ export default function CasesPage() {
               )}
 
               <div>
-                <p className="text-xs uppercase tracking-[0.3em] text-white/40">Timeline</p>
+                <p className="text-xs uppercase tracking-[0.3em] text-white/55">Timeline</p>
                 <div className="timeline mt-4">
                   {timelineLoading ? (
                     <div className="skeleton h-16" />
@@ -2225,7 +2280,7 @@ export default function CasesPage() {
 
               <div className="grid gap-4 md:grid-cols-2">
                 <div>
-                  <p className="text-xs uppercase tracking-[0.3em] text-white/40">SLA</p>
+                  <p className="text-xs uppercase tracking-[0.3em] text-white/55">SLA</p>
                   <div className="mt-2 text-xs text-white/60">
                     {formatRelative(selectedCase.due_date)}
                   </div>
@@ -2303,7 +2358,7 @@ export default function CasesPage() {
                   </div>
                 </div>
                 <div>
-                  <p className="text-xs uppercase tracking-[0.3em] text-white/40">Fecha límite</p>
+                  <p className="text-xs uppercase tracking-[0.3em] text-white/55">Fecha límite</p>
                   <input
                     className="input-base mt-2"
                     type="datetime-local"
@@ -2331,7 +2386,7 @@ export default function CasesPage() {
 
               <div className="grid gap-4 md:grid-cols-2">
                 <div>
-                  <p className="text-xs uppercase tracking-[0.3em] text-white/40">Resumen</p>
+                  <p className="text-xs uppercase tracking-[0.3em] text-white/55">Resumen</p>
                   <textarea
                     className="input-base mt-2 h-24"
                     value={selectedCase.summary ?? ""}
@@ -2342,7 +2397,7 @@ export default function CasesPage() {
                   />
                 </div>
                 <div>
-                  <p className="text-xs uppercase tracking-[0.3em] text-white/40">Recomendación</p>
+                  <p className="text-xs uppercase tracking-[0.3em] text-white/55">Recomendación</p>
                   <textarea
                     className="input-base mt-2 h-24"
                     value={selectedCase.recommendation ?? ""}
@@ -2371,7 +2426,7 @@ export default function CasesPage() {
               </div>
 
               <div>
-                <p className="text-xs uppercase tracking-[0.3em] text-white/40">Notas</p>
+                <p className="text-xs uppercase tracking-[0.3em] text-white/55">Notas</p>
                 <div className="mt-4 grid gap-3">
                   {selectedCase.notes.length === 0 ? (
                     <p className="text-sm text-[var(--muted)]">Sin notas todavía.</p>
@@ -2410,19 +2465,19 @@ export default function CasesPage() {
       {pendingMove && (
         <div className="modal-backdrop" onClick={() => setPendingMove(null)}>
           <div
-            className="modal-panel max-w-md space-y-4"
+            role="dialog" aria-modal="true" className="modal-panel max-w-md space-y-4"
             onClick={(event) => event.stopPropagation()}
           >
             <div>
-              <p className="text-xs uppercase tracking-[0.3em] text-white/40">Mover caso</p>
-              <h3 className="mt-2 text-lg font-semibold">Confirmar cambio de estado</h3>
+              <p className="text-xs uppercase tracking-[0.3em] text-white/55">Mover caso</p>
+              <h3 className="mt-2 text-xl font-semibold">Confirmar cambio de estado</h3>
               <p className="mt-2 text-sm text-[var(--muted)]">
                 {pendingMove.from} → {pendingMove.to}
               </p>
             </div>
             {pendingMove.to === "blocked" && (
               <div className="grid gap-3 text-sm">
-                <label className="text-xs uppercase tracking-[0.3em] text-white/40">
+                <label className="text-xs uppercase tracking-[0.3em] text-white/55">
                   Motivo de bloqueo
                   <textarea
                     className="input-base mt-2 h-20"
@@ -2431,7 +2486,7 @@ export default function CasesPage() {
                     placeholder="Describe el bloqueo"
                   />
                 </label>
-                <label className="text-xs uppercase tracking-[0.3em] text-white/40">
+                <label className="text-xs uppercase tracking-[0.3em] text-white/55">
                   Revisión esperada (opcional)
                   <input
                     className="input-base mt-2"
@@ -2444,7 +2499,7 @@ export default function CasesPage() {
             )}
             {pendingMove.to === "escalated" && (
               <div className="grid gap-3 text-sm">
-                <label className="text-xs uppercase tracking-[0.3em] text-white/40">
+                <label className="text-xs uppercase tracking-[0.3em] text-white/55">
                   Motivo de escalamiento
                   <textarea
                     className="input-base mt-2 h-20"
@@ -2454,7 +2509,7 @@ export default function CasesPage() {
                   />
                 </label>
                 <div className="grid gap-3 md:grid-cols-2">
-                  <label className="text-xs uppercase tracking-[0.3em] text-white/40">
+                  <label className="text-xs uppercase tracking-[0.3em] text-white/55">
                     Nivel
                     <select
                       className="input-base mt-2"
@@ -2466,7 +2521,7 @@ export default function CasesPage() {
                       <option value="3">Nivel 3</option>
                     </select>
                   </label>
-                  <label className="text-xs uppercase tracking-[0.3em] text-white/40">
+                  <label className="text-xs uppercase tracking-[0.3em] text-white/55">
                     Escalar a
                     <select
                       className="input-base mt-2"

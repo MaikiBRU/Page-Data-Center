@@ -54,6 +54,57 @@ PAYMENT_METHODS = {"card", "transfer", "cash", "wallet"}
 SERVICE_LEVELS = {"standard", "express", "same_day"}
 STATUSES = {"delivered", "in_transit", "canceled", "delayed", "returned"}
 
+# Expected type of every known column, declared once.
+#
+# Until now this knowledge was implicit in the rule bodies: `price` was numeric
+# because `_to_float` happened to be called on it. Stating it here lets the
+# schema check reuse exactly the same expectations the rules enforce, instead
+# of maintaining a second, drifting definition.
+#
+#   number      -> must parse as a float
+#   integer     -> must parse as a whole number
+#   date        -> must parse as an ISO timestamp
+#   category    -> must belong to the declared set
+#   boolean     -> true/false/1/0
+#   text        -> anything (not type checked)
+CATEGORY_VALUES: dict[str, set[str]] = {
+    "delivery_window": DELIVERY_WINDOWS,
+    "channel": CHANNELS,
+    "payment_method": PAYMENT_METHODS,
+    "service_level": SERVICE_LEVELS,
+    "status": STATUSES,
+}
+
+FIELD_TYPES: dict[str, str] = {
+    "order_id": "text",
+    "customer_id": "text",
+    "sku": "text",
+    "price": "number",
+    "quantity": "integer",
+    "stock": "integer",
+    "weight_kg": "number",
+    "lead_time_days": "integer",
+    "discount_pct": "number",
+    "shipped_at": "date",
+    "delivered_at": "date",
+    "address": "text",
+    "city": "text",
+    "postal_code": "text",
+    "warehouse": "text",
+    "shipping_provider": "text",
+    "address_valid": "boolean",
+    "delivery_window": "category",
+    "channel": "category",
+    "payment_method": "category",
+    "service_level": "category",
+    "status": "category",
+}
+
+# The row identity. Without it there is no way to tell rows apart, deduplicate
+# them, or tie a finding back to a record, so a CSV lacking it is not a dataset
+# of this domain regardless of what else it carries.
+IDENTITY_FIELD = "order_id"
+
 RULES_CATALOG = {
     "missing_value": "Campos requeridos faltantes",
     "missing_optional": "Campos operativos opcionales faltantes",
@@ -61,7 +112,7 @@ RULES_CATALOG = {
     "invalid_price": "Precio inválido",
     "invalid_quantity": "Cantidad inválida",
     "invalid_stock": "Stock negativo",
-    "invalid_address": "Dirección inválida",
+    "invalid_address": "Dirección sin calle o sin numeración",
     "invalid_postal_code": "Código postal inválido",
     "invalid_delivery_time": "Delivery time inconsistente",
     "invalid_weight": "Peso inválido",
@@ -194,6 +245,32 @@ DOMAIN_PROFILES = {
 
 DOMAIN_RULES = {key: value["rules"] for key, value in DOMAIN_PROFILES.items()}
 
+# Used when a caller does not specify a domain at all.
+DEFAULT_DOMAIN = "ecommerce-logistica"
+
+
+# Severity is a declared business policy, not a derived number: these findings
+# block fulfilment, so they are the ones worth fixing first. Kept in one place
+# because both the per-row scan and the issue list need the same answer.
+HIGH_SEVERITY_CODES = {
+    "invalid_address",
+    "invalid_price",
+    "invalid_delivery_time",
+    "missing_delivered_at",
+    "duplicate_order_id",
+}
+HIGH_SEVERITY_MISSING_FIELDS = {"order_id", "address", "postal_code"}
+LOW_SEVERITY_CODES = {"missing_optional"}
+
+
+def severity_for(code: str, field: str | None = None) -> str:
+    """Severity of a single finding."""
+    if code in LOW_SEVERITY_CODES:
+        return "low"
+    if code == "missing_value":
+        return "high" if field in HIGH_SEVERITY_MISSING_FIELDS else "medium"
+    return "high" if code in HIGH_SEVERITY_CODES else "medium"
+
 
 def _to_float(value: str) -> float | None:
     try:
@@ -222,14 +299,32 @@ def load_records(file_path: str) -> List[Dict[str, Any]]:
         return [row for row in reader]
 
 
+class UnknownDomainError(ValueError):
+    """A domain was requested that has no rule profile."""
+
+
 def _profile(domain: str | None) -> Dict[str, Any]:
-    if not domain:
-        return DOMAIN_PROFILES["ecommerce-logistica"]
-    return DOMAIN_PROFILES.get(domain, DOMAIN_PROFILES["ecommerce-logistica"])
+    """Resolve a domain to its profile.
+
+    ``None`` means "not specified" and resolves to the default profile, which
+    is the documented behaviour of the callers' optional argument. An unknown
+    *name*, however, is a bug or a stale value: silently analysing it against
+    the wrong column set produced results that looked valid and were not, so
+    it raises instead.
+    """
+    if domain is None:
+        return DOMAIN_PROFILES[DEFAULT_DOMAIN]
+    profile = DOMAIN_PROFILES.get(domain)
+    if profile is None:
+        known = ", ".join(sorted(DOMAIN_PROFILES))
+        raise UnknownDomainError(f"Dominio desconocido: {domain!r}. Conocidos: {known}")
+    return profile
 
 
 def _active_rules(domain: str | None, disabled: set[str]) -> list[str]:
-    rules = DOMAIN_RULES.get(domain or "ecommerce-logistica", [])
+    # Goes through _profile so an unknown domain raises here too, instead of
+    # quietly producing an empty rule list and an all-clear result.
+    rules = _profile(domain)["rules"]
     return [rule for rule in rules if rule not in disabled]
 
 
@@ -250,15 +345,40 @@ def run_quality_checks(
     seen_orders: set[str] = set()
     optional_missing = {field: 0 for field in optional_fields}
 
-    for row in records:
+    # Row-level bookkeeping. A row can break several rules, so counting
+    # findings tells you nothing about how much of the dataset is actually
+    # damaged. These sets answer that: how many distinct rows failed at least
+    # one rule, and how many failed a high severity one.
+    affected_rows: set[int] = set()
+    critical_rows: set[int] = set()
+
+    def flag(index: int, code: str, row_data: Dict[str, Any], field: str | None = None) -> None:
+        invalid_values.append({"code": code, "row": row_data})
+        affected_rows.add(index)
+        if severity_for(code, field) == "high":
+            critical_rows.add(index)
+
+    def mark(index: int, code: str, field: str | None = None) -> None:
+        """Record a row as affected without adding to the invalid_values list.
+
+        Used by the aggregated counters (missing_by_field, optional_missing,
+        duplicates) which build their issue entries separately.
+        """
+        affected_rows.add(index)
+        if severity_for(code, field) == "high":
+            critical_rows.add(index)
+
+    for index, row in enumerate(records):
         order_id = (row.get("order_id") or "").strip()
-        if "missing_value" in active_rules:
-            if not order_id:
-                invalid_values.append({"code": "missing_order_id", "row": row})
+        # An empty order_id is reported once, by the generic missing_value
+        # rule below (order_id is a required field of every profile). There
+        # used to be a `missing_order_id` finding here as well, which counted
+        # the same condition on the same rows a second time.
         if "duplicate_order_id" in active_rules:
             if order_id:
                 if order_id in seen_orders:
                     duplicate_order_ids += 1
+                    mark(index, "duplicate_order_id")
                 else:
                     seen_orders.add(order_id)
 
@@ -270,28 +390,38 @@ def run_quality_checks(
             value = (row.get(field) or "").strip()
             if not value and "missing_value" in active_rules:
                 missing_by_field[field] += 1
+                mark(index, "missing_value", field)
 
         for field in optional_fields:
             if field in row:
                 value = (row.get(field) or "").strip()
                 if not value and "missing_optional" in active_rules:
                     optional_missing[field] += 1
+                    mark(index, "missing_optional", field)
 
         price = _to_float(row.get("price", ""))
         if (price is None or price <= 0) and "invalid_price" in active_rules:
-            invalid_values.append({"code": "invalid_price", "row": row})
+            flag(index, "invalid_price", row)
 
         quantity = _to_int(row.get("quantity", ""))
         if (quantity is None or quantity <= 0) and "invalid_quantity" in active_rules:
-            invalid_values.append({"code": "invalid_quantity", "row": row})
+            flag(index, "invalid_quantity", row)
 
         stock = _to_int(row.get("stock", ""))
         if (stock is None or stock < 0) and "invalid_stock" in active_rules:
-            invalid_values.append({"code": "invalid_stock", "row": row})
+            flag(index, "invalid_stock", row)
 
         address = (row.get("address") or "").strip()
-        if len(address) < 6 and "invalid_address" in active_rules:
-            invalid_values.append({"code": "invalid_address", "row": row})
+        # A street reference needs a street name and a street number, so it
+        # must contain at least one letter and at least one digit. The rule
+        # used to be `len(address) < 6`, which rejected legitimate short
+        # addresses ("Av 9") while accepting incomplete ones ("Sarmiento",
+        # nine characters and no number), and which fired on every empty
+        # address on top of the missing_value rule that already reported it.
+        # Emptiness is completeness, not validity, and is left to that rule.
+        if address and "invalid_address" in active_rules:
+            if not (any(c.isalpha() for c in address) and any(c.isdigit() for c in address)):
+                flag(index, "invalid_address", row)
 
         postal_code = (row.get("postal_code") or "").strip()
         if (
@@ -299,26 +429,26 @@ def run_quality_checks(
             and not postal_code.replace("-", "").isdigit()
             and "invalid_postal_code" in active_rules
         ):
-            invalid_values.append({"code": "invalid_postal_code", "row": row})
+            flag(index, "invalid_postal_code", row)
 
         shipped_at = _parse_date(row.get("shipped_at", ""))
         delivered_at = _parse_date(row.get("delivered_at", ""))
         if status and status not in STATUSES:
             if "invalid_status" in active_rules:
-                invalid_values.append({"code": "invalid_status", "row": row})
+                flag(index, "invalid_status", row)
         if status == "delivered" and delivered_at is None and "invalid_delivery_time" in active_rules:
-            invalid_values.append({"code": "missing_delivered_at", "row": row})
+            flag(index, "missing_delivered_at", row)
         if (
             shipped_at
             and delivered_at
             and delivered_at < shipped_at
             and "invalid_delivery_time" in active_rules
         ):
-            invalid_values.append({"code": "invalid_delivery_time", "row": row})
+            flag(index, "invalid_delivery_time", row)
 
         weight = _to_float(row.get("weight_kg", ""))
         if (weight is None or weight <= 0) and "invalid_weight" in active_rules:
-            invalid_values.append({"code": "invalid_weight", "row": row})
+            flag(index, "invalid_weight", row)
 
         lead_time = _to_int(row.get("lead_time_days", ""))
         if (
@@ -326,7 +456,7 @@ def run_quality_checks(
             and (lead_time < 0 or lead_time > 21)
             and "invalid_lead_time" in active_rules
         ):
-            invalid_values.append({"code": "invalid_lead_time", "row": row})
+            flag(index, "invalid_lead_time", row)
 
         delivery_window = (row.get("delivery_window") or "").strip()
         if (
@@ -334,7 +464,7 @@ def run_quality_checks(
             and delivery_window not in DELIVERY_WINDOWS
             and "invalid_delivery_window" in active_rules
         ):
-            invalid_values.append({"code": "invalid_delivery_window", "row": row})
+            flag(index, "invalid_delivery_window", row)
 
         address_valid = (row.get("address_valid") or "").strip().lower()
         if (
@@ -342,17 +472,17 @@ def run_quality_checks(
             and address_valid not in {"true", "false", "1", "0"}
             and "invalid_address_flag" in active_rules
         ):
-            invalid_values.append({"code": "invalid_address_flag", "row": row})
+            flag(index, "invalid_address_flag", row)
         if (
             address_valid in {"false", "0"}
             and len(address) >= 6
             and "address_flag_mismatch" in active_rules
         ):
-            invalid_values.append({"code": "address_flag_mismatch", "row": row})
+            flag(index, "address_flag_mismatch", row)
 
         channel = (row.get("channel") or "").strip()
         if channel and channel not in CHANNELS and "invalid_channel" in active_rules:
-            invalid_values.append({"code": "invalid_channel", "row": row})
+            flag(index, "invalid_channel", row)
 
         payment_method = (row.get("payment_method") or "").strip()
         if (
@@ -360,7 +490,7 @@ def run_quality_checks(
             and payment_method not in PAYMENT_METHODS
             and "invalid_payment_method" in active_rules
         ):
-            invalid_values.append({"code": "invalid_payment_method", "row": row})
+            flag(index, "invalid_payment_method", row)
 
         service_level = (row.get("service_level") or "").strip()
         if (
@@ -368,7 +498,7 @@ def run_quality_checks(
             and service_level not in SERVICE_LEVELS
             and "invalid_service_level" in active_rules
         ):
-            invalid_values.append({"code": "invalid_service_level", "row": row})
+            flag(index, "invalid_service_level", row)
 
         discount = _to_float(row.get("discount_pct", ""))
         if (
@@ -376,7 +506,7 @@ def run_quality_checks(
             and (discount < 0 or discount > 60)
             and "invalid_discount" in active_rules
         ):
-            invalid_values.append({"code": "invalid_discount", "row": row})
+            flag(index, "invalid_discount", row)
 
     issues: List[Dict[str, Any]] = []
     for field, count in missing_by_field.items():
@@ -385,7 +515,7 @@ def run_quality_checks(
                 "code": "missing_value",
                 "field": field,
                 "count": count,
-                "severity": "high" if field in {"address", "postal_code", "order_id"} else "medium",
+                "severity": severity_for("missing_value", field),
             })
 
     for field, count in optional_missing.items():
@@ -412,15 +542,22 @@ def run_quality_checks(
         issues.append({
             "code": code,
             "count": count,
-            "severity": "high"
-            if code in {"invalid_address", "invalid_price", "invalid_delivery_time"}
-            else "medium",
+            "severity": severity_for(code),
         })
 
     summary = {
         "total_rows": total,
         "missing_by_field": missing_by_field,
+        # Number of distinct findings, i.e. (rule, field) pairs that fired at
+        # least once. NOT a row count.
         "issue_count": len(issues),
+        # Total times any rule fired. A single row breaking three rules
+        # contributes three. NOT a row count either.
+        "rule_violations": sum(int(issue.get("count", 0) or 0) for issue in issues),
+        # Distinct rows failing at least one active rule. Bounded by total_rows.
+        "rows_affected": len(affected_rows),
+        # Distinct rows failing at least one high severity rule.
+        "critical_rows": len(critical_rows),
         "domain_profile": domain or "ecommerce-logistica",
         "active_rule_ids": active_rules,
         "active_rules": [RULES_CATALOG.get(rule, rule) for rule in active_rules],
@@ -428,11 +565,62 @@ def run_quality_checks(
     return summary, issues
 
 
+# Modified z-score threshold. 3.5 is the value recommended by Iglewicz and
+# Hoaglin (1993), "How to Detect and Handle Outliers"; it is a published
+# constant, not a number tuned until this project's demo data looked good.
+ANOMALY_THRESHOLD = 3.5
+
+# Consistency constants. 1.4826 makes the MAD an unbiased estimator of sigma
+# for normally distributed data; 1.2533 does the same for the mean absolute
+# deviation, used only when the MAD collapses to zero.
+_MAD_SCALE = 1.4826
+_MEANAD_SCALE = 1.2533
+
+# Below this many values a centre and a spread cannot be estimated with any
+# confidence, so the column is skipped rather than guessed at.
+MIN_VALUES_FOR_ANOMALY = 12
+
+
+def robust_scale(values: List[float], centre: float) -> float:
+    """Spread of a sample, resistant to the outliers being looked for.
+
+    The previous implementation used the standard deviation of the whole
+    sample, including the outliers. With 12% contamination that inflated sigma
+    enough for the outliers to fall inside their own threshold -- the classic
+    masking effect. The MAD has a breakdown point of 50%, so it barely moves
+    until half the data is contaminated.
+
+    Falls back to the mean absolute deviation when more than half the values
+    are identical (MAD = 0), and returns 0.0 for a constant column, which the
+    caller treats as "nothing to measure".
+    """
+    deviations = [abs(value - centre) for value in values]
+    mad = statistics.median(deviations)
+    if mad > 0:
+        return _MAD_SCALE * mad
+    mean_ad = sum(deviations) / len(deviations)
+    if mean_ad > 0:
+        return _MEANAD_SCALE * mean_ad
+    return 0.0
+
+
 def run_anomaly_detection(
     records: List[Dict[str, Any]],
     domain: str | None = None,
     disabled_rules: List[str] | None = None,
+    threshold: float = ANOMALY_THRESHOLD,
 ) -> Dict[str, Any]:
+    """Flag numeric values that are far from the centre of their own column.
+
+    This looks for values that are *legal but implausible*: a price of 6.000
+    in a catalogue that runs 10 to 500 breaks no rule, yet is almost certainly
+    a misplaced decimal point. Impossible values -- negative prices, negative
+    stock -- are not outliers and are not reported here; the domain rules
+    already reject them, and reporting them twice under two names would
+    overstate how much is wrong.
+
+    Uses the modified z-score: (value - median) / (1.4826 * MAD).
+    """
     def values_for(field: str) -> List[float]:
         values = []
         for row in records:
@@ -440,11 +628,6 @@ def run_anomaly_detection(
             if value is not None:
                 values.append(value)
         return values
-
-    def zscore(value: float, mean: float, stdev: float) -> float:
-        if stdev == 0:
-            return 0.0
-        return (value - mean) / stdev
 
     fields = _profile(domain)["anomaly_fields"]
     if disabled_rules:
@@ -462,19 +645,31 @@ def run_anomaly_detection(
             for field in fields
             if field_map.get(field, "") not in disabled_set
         ]
+
     anomalies: List[Dict[str, Any]] = []
+    field_stats: Dict[str, Dict[str, Any]] = {}
     for field in fields:
         values = values_for(field)
-        if len(values) < 5:
+        if len(values) < MIN_VALUES_FOR_ANOMALY:
             continue
-        mean = statistics.mean(values)
-        stdev = statistics.pstdev(values)
+        centre = statistics.median(values)
+        scale = robust_scale(values, centre)
+        if scale <= 0:
+            # Constant column: every value is the centre, nothing is far from it.
+            continue
+        field_stats[field] = {
+            "median": round(centre, 4),
+            "scale": round(scale, 4),
+            "values_checked": len(values),
+        }
         for row in records:
             raw_value = _to_float(row.get(field, ""))
             if raw_value is None:
+                # Missing values are a completeness problem, owned by the
+                # missing_value rules. A gap has no distance to a centre.
                 continue
-            score = zscore(raw_value, mean, stdev)
-            if abs(score) >= 3:
+            score = (raw_value - centre) / scale
+            if abs(score) >= threshold:
                 anomalies.append({
                     "field": field,
                     "value": raw_value,
@@ -485,6 +680,9 @@ def run_anomaly_detection(
     return {
         "anomaly_count": len(anomalies),
         "anomalies": anomalies[:50],
+        "method": "modified_zscore_mad",
+        "threshold": threshold,
+        "fields_analyzed": field_stats,
     }
 
 

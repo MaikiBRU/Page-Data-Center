@@ -7,3 +7,5 @@ from app.models.case_activity_log import CaseActivityLog
 from app.models.email_verification import EmailVerification
 from app.models.audit_log import AuditLog
 from app.models.dataset_run import DatasetRun
+from app.models.demo_session import DemoSession
+from app.models.demo_dataset_file import DemoDatasetFile

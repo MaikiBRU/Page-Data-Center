@@ -72,7 +72,7 @@ export function FlowSteps({ flow, onGuide }: FlowStepsProps) {
       <section className="panel">
         <div className="flex items-center justify-between">
           <div>
-            <p className="text-xs uppercase tracking-[0.3em] text-white/40">Flujo</p>
+            <p className="text-xs uppercase tracking-[0.3em] text-white/55">Flujo</p>
             <h3 className="mt-2 text-xl font-semibold">Cargando progreso...</h3>
           </div>
           {onGuide && (
@@ -101,7 +101,7 @@ export function FlowSteps({ flow, onGuide }: FlowStepsProps) {
     <section className="panel">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <p className="text-xs uppercase tracking-[0.3em] text-white/40">UX / Flujo</p>
+          <p className="text-xs uppercase tracking-[0.3em] text-white/55">UX / Flujo</p>
           <h3 className="mt-2 text-xl font-semibold">Progreso operativo</h3>
           <p className="mt-2 text-sm text-[var(--muted)]">
             Seguí este orden para maximizar impacto desde datos hasta acciones.

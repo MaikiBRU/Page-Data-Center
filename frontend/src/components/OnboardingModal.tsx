@@ -2,6 +2,8 @@
 
 import Link from "next/link";
 
+import { useEscapeKey } from "@/lib/useEscapeKey";
+
 type OnboardingStep = {
   title: string;
   description: string;
@@ -17,14 +19,16 @@ type OnboardingModalProps = {
 };
 
 export function OnboardingModal({ open, steps, onClose, onDone }: OnboardingModalProps) {
+  useEscapeKey(open, onClose);
+
   if (!open) return null;
 
   return (
     <div className="modal-backdrop">
-      <div className="modal-panel w-full max-w-3xl space-y-6">
+      <div role="dialog" aria-modal="true" className="modal-panel w-full max-w-3xl space-y-6">
         <div className="flex flex-wrap items-center justify-between gap-4">
           <div>
-            <p className="text-xs uppercase tracking-[0.3em] text-white/40">Guía rápida</p>
+            <p className="text-xs uppercase tracking-[0.3em] text-white/55">Guía rápida</p>
             <h3 className="mt-2 text-2xl font-semibold">Primeros pasos</h3>
             <p className="mt-2 text-sm text-[var(--muted)]">
               Seguí este flujo para construir valor en minutos.

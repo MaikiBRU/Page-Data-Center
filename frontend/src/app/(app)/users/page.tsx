@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { apiFetch } from "@/lib/api";
 import { emitToast } from "@/lib/toast";
 import { EmptyState } from "@/components/EmptyState";
+import { useEscapeKey } from "@/lib/useEscapeKey";
 
 type UserRow = {
   id: number;
@@ -194,6 +195,11 @@ export default function UsersPage() {
     }
   };
 
+  // Every overlay in the app was mouse-only; Escape now closes them.
+  useEscapeKey(Boolean(resetTarget), () => setResetTarget(null));
+  useEscapeKey(Boolean(confirmResetTarget), () => setConfirmResetTarget(null));
+  useEscapeKey(Boolean(confirmAction), () => setConfirmAction(null));
+
   if (loading) {
     return (
       <section className="panel">
@@ -272,7 +278,7 @@ export default function UsersPage() {
         className="grid gap-4 rounded-2xl border border-white/10 bg-white/5 p-5"
       >
         <div>
-          <p className="text-xs uppercase tracking-[0.3em] text-white/40">Nuevo usuario</p>
+          <p className="text-xs uppercase tracking-[0.3em] text-white/55">Nuevo usuario</p>
           <p className="mt-2 text-sm text-[var(--muted)]">
             Creá un usuario interno con contraseña y rol.
           </p>
@@ -361,7 +367,7 @@ export default function UsersPage() {
               <tr key={user.id}>
                 <td className="px-4 py-3">
                   <div className="text-white/90">{user.email}</div>
-                  <div className="text-xs text-white/40">
+                  <div className="text-xs text-white/55">
                     {user.is_verified ? "Verificado" : "Sin verificar"}
                   </div>
                 </td>
@@ -408,7 +414,7 @@ export default function UsersPage() {
                     </button>
                     {!user.is_admin && (
                       <select
-                        className="input-base h-8 w-28 text-xs"
+                        className="input-base w-28 text-xs"
                         value={user.role}
                         onChange={(event) =>
                           updateUser(user.id, { role: event.target.value })
@@ -453,7 +459,7 @@ export default function UsersPage() {
 
       <div className="scroll-soft overflow-auto rounded-2xl border border-white/10">
         <div className="border-b border-white/10 px-4 py-3">
-          <h3 className="text-lg font-semibold">Auditoría</h3>
+          <h3 className="text-xl font-semibold">Auditoría</h3>
           <p className="text-sm text-[var(--muted)]">
             Últimas acciones administrativas sobre usuarios.
           </p>
@@ -506,7 +512,7 @@ export default function UsersPage() {
         <div className="modal-backdrop">
           <form
             onSubmit={handleReset}
-            className="modal-panel max-w-lg space-y-4"
+            role="dialog" aria-modal="true" className="modal-panel max-w-lg space-y-4"
           >
             <div>
               <h3 className="text-xl font-semibold">Resetear contraseña</h3>
@@ -554,9 +560,9 @@ export default function UsersPage() {
 
       {confirmAction && (
         <div className="modal-backdrop">
-          <div className="modal-panel max-w-md space-y-4">
+          <div role="dialog" aria-modal="true" className="modal-panel max-w-md space-y-4">
             <div>
-              <h3 className="text-lg font-semibold">{confirmTitle()}</h3>
+              <h3 className="text-xl font-semibold">{confirmTitle()}</h3>
               <p className="mt-2 text-sm text-[var(--muted)]">{confirmText()}</p>
               <p className="mt-2 text-xs text-white/50">
                 Usuario: {confirmAction.user.email}
@@ -596,9 +602,9 @@ export default function UsersPage() {
 
       {confirmResetTarget && (
         <div className="modal-backdrop">
-          <div className="modal-panel max-w-md space-y-4">
+          <div role="dialog" aria-modal="true" className="modal-panel max-w-md space-y-4">
             <div>
-              <h3 className="text-lg font-semibold">Resetear contraseña</h3>
+              <h3 className="text-xl font-semibold">Resetear contraseña</h3>
               <p className="mt-2 text-sm text-[var(--muted)]">
                 Se invalidarán todas las sesiones activas del usuario.
               </p>

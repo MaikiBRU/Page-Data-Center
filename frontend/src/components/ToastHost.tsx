@@ -39,7 +39,13 @@ export function ToastHost() {
   if (items.length === 0) return null;
 
   return (
-    <div className="pointer-events-none fixed left-1/2 top-4 z-50 flex w-[360px] -translate-x-1/2 flex-col gap-3">
+    // Toasts are the only confirmation for most actions here, so they are
+    // announced rather than being purely visual.
+    <div
+      role="status"
+      aria-live="polite"
+      className="pointer-events-none fixed left-1/2 top-4 z-[60] flex w-[min(22.5rem,calc(100vw-2rem))] -translate-x-1/2 flex-col gap-3"
+    >
       {items.map((toast) => (
         <div
           key={toast.id}

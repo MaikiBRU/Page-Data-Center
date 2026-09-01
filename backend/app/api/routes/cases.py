@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from html import escape
 import csv
 import io
 from typing import Any
@@ -9,7 +10,18 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 
-from app.api.deps import get_current_user, get_db, require_permission
+from app.api.deps import (
+    Principal,
+    demo_quota_error,
+    get_db,
+    get_principal,
+    get_scoped_case,
+    get_scoped_dataset,
+    require_permission,
+    scope_cases,
+    scope_datasets,
+)
+from app.services import demo_session as demo_service
 from app.models.case import Case
 from app.models.dataset import Dataset
 from app.models.case_note import CaseNote
@@ -115,9 +127,9 @@ def list_cases(
     sla_state: str | None = None,
     sort: str | None = None,
     db: Session = Depends(get_db),
-    user=Depends(get_current_user),
+    principal: Principal = Depends(get_principal),
 ):
-    query = db.query(Case)
+    query = scope_cases(db.query(Case), principal)
     query = _apply_filters(query, status, severity, dataset_id, assignee, q, sla_state)
     query = _apply_sort(query, sort)
     return query.all()
@@ -132,9 +144,9 @@ def cases_summary(
     q: str | None = None,
     sla_state: str | None = None,
     db: Session = Depends(get_db),
-    user=Depends(get_current_user),
+    principal: Principal = Depends(get_principal),
 ):
-    query = db.query(Case)
+    query = scope_cases(db.query(Case), principal)
     query = _apply_filters(query, status, severity, dataset_id, assignee, q, sla_state)
     rows = query.all()
     now = datetime.utcnow()
@@ -198,10 +210,13 @@ def export_cases(
     sla_state: str | None = None,
     sort: str | None = None,
     db: Session = Depends(get_db),
-    user=Depends(get_current_user),
+    principal: Principal = Depends(get_principal),
 ):
-    query = db.query(Case, Dataset.name.label("dataset_name")).join(
-        Dataset, Dataset.id == Case.dataset_id
+    query = scope_cases(
+        db.query(Case, Dataset.name.label("dataset_name")).join(
+            Dataset, Dataset.id == Case.dataset_id
+        ),
+        principal,
     )
     query = _apply_filters(query, status, severity, dataset_id, assignee, q, sla_state)
     query = _apply_sort(query, sort)
@@ -272,7 +287,7 @@ def export_cases(
 def bulk_update_cases(
     payload: CaseBulkUpdate,
     db: Session = Depends(get_db),
-    user=Depends(require_permission("case:update")),
+    principal: Principal = Depends(require_permission("case:update")),
 ):
     if not payload.case_ids:
         raise HTTPException(status_code=400, detail="case_ids required")
@@ -286,13 +301,15 @@ def bulk_update_cases(
         raise HTTPException(status_code=400, detail="No changes provided")
     if payload.status and payload.status not in _STATUSES:
         raise HTTPException(status_code=400, detail="Invalid status")
-    cases = db.query(Case).filter(Case.id.in_(payload.case_ids)).all()
+    cases = scope_cases(db.query(Case).filter(Case.id.in_(payload.case_ids)), principal).all()
     if not cases:
         return {"updated": 0}
     dataset_ids = {case.dataset_id for case in cases}
     dataset_map = {}
     if dataset_ids:
-        rows = db.query(Dataset).filter(Dataset.id.in_(dataset_ids)).all()
+        rows = scope_datasets(
+            db.query(Dataset).filter(Dataset.id.in_(dataset_ids)), principal
+        ).all()
         dataset_map = {row.id: row.domain for row in rows}
     now = datetime.utcnow()
     for case in cases:
@@ -327,7 +344,7 @@ def bulk_update_cases(
                     case_id=case.id,
                     from_status=previous_status,
                     to_status=case.status,
-                    actor_email=user.email,
+                    actor_email=principal.email,
                 )
             )
         if "assignee" in fields and previous_assignee != case.assignee:
@@ -335,7 +352,7 @@ def bulk_update_cases(
                 CaseActivityLog(
                     case_id=case.id,
                     event_type="assignment",
-                    actor_email=user.email,
+                    actor_email=principal.email,
                     meta={"from": previous_assignee, "to": case.assignee},
                 )
             )
@@ -344,7 +361,7 @@ def bulk_update_cases(
                 CaseActivityLog(
                     case_id=case.id,
                     event_type="sla",
-                    actor_email=user.email,
+                    actor_email=principal.email,
                     meta={
                         "from": previous_sla,
                         "to": case.sla_hours,
@@ -361,7 +378,7 @@ def bulk_update_cases(
 def bulk_create_cases(
     payload: CaseBulkCreate,
     db: Session = Depends(get_db),
-    user=Depends(require_permission("case:create")),
+    principal: Principal = Depends(require_permission("case:create")),
 ):
     if not payload.items:
         raise HTTPException(status_code=400, detail="items required")
@@ -369,7 +386,9 @@ def bulk_create_cases(
         raise HTTPException(status_code=400, detail="Max 200 items per batch")
 
     dataset_ids = {item.dataset_id for item in payload.items}
-    datasets = db.query(Dataset).filter(Dataset.id.in_(dataset_ids)).all()
+    datasets = scope_datasets(
+        db.query(Dataset).filter(Dataset.id.in_(dataset_ids)), principal
+    ).all()
     dataset_map = {dataset.id: dataset for dataset in datasets}
     if len(dataset_map) != len(dataset_ids):
         raise HTTPException(status_code=400, detail="Dataset not found")
@@ -423,6 +442,7 @@ def bulk_create_cases(
             assignee = pick_assignee(db, dataset)
         case = Case(
             dataset_id=item.dataset_id,
+            demo_session_id=principal.demo_session_id,
             title=row["title"],
             severity=item.severity,
             status=item.status,
@@ -445,7 +465,7 @@ def bulk_create_cases(
                 case_id=case.id,
                 from_status=None,
                 to_status=case.status,
-                actor_email=user.email,
+                actor_email=principal.email,
                 reason=item.status_reason
                 or item.blocked_reason
                 or item.escalated_reason,
@@ -456,7 +476,7 @@ def bulk_create_cases(
                 CaseActivityLog(
                     case_id=case.id,
                     event_type="assignment",
-                    actor_email=user.email,
+                    actor_email=principal.email,
                     meta={"from": None, "to": case.assignee},
                 )
             )
@@ -465,10 +485,8 @@ def bulk_create_cases(
 
 
 @router.get("/{case_id}", response_model=CaseDetail)
-def get_case(case_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
-    case = db.query(Case).filter(Case.id == case_id).first()
-    if not case:
-        raise HTTPException(status_code=404, detail="Case not found")
+def get_case(case_id: int, db: Session = Depends(get_db), principal: Principal = Depends(get_principal)):
+    case = get_scoped_case(db, principal, case_id)
     notes = db.query(CaseNote).filter(CaseNote.case_id == case_id).order_by(CaseNote.created_at.desc()).all()
     detail = CaseDetail.model_validate(case)
     detail.notes = notes
@@ -476,10 +494,8 @@ def get_case(case_id: int, db: Session = Depends(get_db), user=Depends(get_curre
 
 
 @router.get("/{case_id}/timeline", response_model=list[CaseTimelineItem])
-def case_timeline(case_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
-    case = db.query(Case).filter(Case.id == case_id).first()
-    if not case:
-        raise HTTPException(status_code=404, detail="Case not found")
+def case_timeline(case_id: int, db: Session = Depends(get_db), principal: Principal = Depends(get_principal)):
+    case = get_scoped_case(db, principal, case_id)
     notes = db.query(CaseNote).filter(CaseNote.case_id == case_id).all()
     status_logs = db.query(CaseStatusLog).filter(CaseStatusLog.case_id == case_id).all()
     activity_logs = db.query(CaseActivityLog).filter(CaseActivityLog.case_id == case_id).all()
@@ -542,12 +558,18 @@ def case_report(
     case_id: int,
     format: str = "html",
     db: Session = Depends(get_db),
-    user=Depends(get_current_user),
+    principal: Principal = Depends(get_principal),
 ):
-    case = db.query(Case).filter(Case.id == case_id).first()
-    if not case:
-        raise HTTPException(status_code=404, detail="Case not found")
-    dataset = db.query(Dataset).filter(Dataset.id == case.dataset_id).first()
+    case = get_scoped_case(db, principal, case_id)
+    if principal.is_demo:
+        try:
+            demo_service.assert_can_export(principal.demo)
+        except demo_service.DemoQuotaExceeded as exc:
+            raise demo_quota_error(exc) from None
+        demo_service.register_export(db, principal.demo)
+    dataset = (
+        scope_datasets(db.query(Dataset).filter(Dataset.id == case.dataset_id), principal).first()
+    )
     notes = db.query(CaseNote).filter(CaseNote.case_id == case_id).order_by(CaseNote.created_at.desc()).all()
     if format == "html":
         html = f"""
@@ -568,21 +590,21 @@ def case_report(
           <body>
             <div class="panel">
               <h1>Reporte de Caso #{case.id}</h1>
-              <div class="muted">Dataset: {dataset.name if dataset else case.dataset_id}</div>
+              <div class="muted">Dataset: {escape(str(dataset.name if dataset else case.dataset_id))}</div>
               <div class="muted">Actualizado: {case.updated_at}</div>
               <div style="margin-top: 12px;">
-                <span class="badge">Estado: {case.status}</span>
-                <span class="badge">Severidad: {case.severity}</span>
-                <span class="badge">Asignado: {case.assignee or "Sin asignar"}</span>
+                <span class="badge">Estado: {escape(str(case.status))}</span>
+                <span class="badge">Severidad: {escape(str(case.severity))}</span>
+                <span class="badge">Asignado: {escape(str(case.assignee or "Sin asignar"))}</span>
               </div>
               <div class="grid" style="margin-top: 16px;">
                 <div>
                   <h3>Resumen</h3>
-                  <p>{case.summary or "-"}</p>
+                  <p>{escape(str(case.summary or "-"))}</p>
                 </div>
                 <div>
                   <h3>Recomendación</h3>
-                  <p>{case.recommendation or "-"}</p>
+                  <p>{escape(str(case.recommendation or "-"))}</p>
                 </div>
               </div>
               <div style="margin-top: 16px;">
@@ -591,21 +613,28 @@ def case_report(
               </div>
               <div style="margin-top: 16px;">
                 <h3>Estado avanzado</h3>
-                <p>Bloqueo: {case.blocked_reason or "-"}</p>
+                <p>Bloqueo: {escape(str(case.blocked_reason or "-"))}</p>
                 <p>Revisión esperada: {case.blocked_until or "-"}</p>
-                <p>Escalado: {case.escalated_reason or "-"}</p>
+                <p>Escalado: {escape(str(case.escalated_reason or "-"))}</p>
                 <p>Nivel: {case.escalated_level or "-"}</p>
-                <p>Escalado a: {case.escalated_to or "-"}</p>
+                <p>Escalado a: {escape(str(case.escalated_to or "-"))}</p>
               </div>
               <div style="margin-top: 16px;">
                 <h3>Notas</h3>
-                {"".join([f"<div class='note'><strong>{n.author}</strong> ({n.created_at})<br/>{n.note}</div>" for n in notes]) or "<p class='muted'>Sin notas</p>"}
+                {"".join([f"<div class='note'><strong>{escape(str(n.author))}</strong> ({escape(str(n.created_at))})<br/>{escape(str(n.note))}</div>" for n in notes]) or "<p class='muted'>Sin notas</p>"}
               </div>
             </div>
           </body>
         </html>
         """
-        return HTMLResponse(content=html)
+        return HTMLResponse(
+            content=html,
+            headers={
+                "Content-Disposition": f'attachment; filename="case_{case.id}.html"',
+                "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     if format == "pdf":
         try:
@@ -694,16 +723,16 @@ def update_case(
     case_id: int,
     payload: CaseUpdate,
     db: Session = Depends(get_db),
-    user=Depends(require_permission("case:update")),
+    principal: Principal = Depends(require_permission("case:update")),
 ):
-    case = db.query(Case).filter(Case.id == case_id).first()
-    if not case:
-        raise HTTPException(status_code=404, detail="Case not found")
+    case = get_scoped_case(db, principal, case_id)
     if payload.status not in _STATUSES:
         raise HTTPException(status_code=400, detail="Invalid status")
     dataset = None
     if "sla_hours" in payload.model_fields_set or "due_date" in payload.model_fields_set:
-        dataset = db.query(Dataset).filter(Dataset.id == case.dataset_id).first()
+        dataset = scope_datasets(
+            db.query(Dataset).filter(Dataset.id == case.dataset_id), principal
+        ).first()
     previous_status = case.status
     previous_assignee = case.assignee
     previous_due = case.due_date
@@ -774,7 +803,7 @@ def update_case(
                 case_id=case.id,
                 from_status=previous_status,
                 to_status=case.status,
-                actor_email=user.email,
+                actor_email=principal.email,
                 reason=payload.status_reason
                 or case.blocked_reason
                 or case.escalated_reason,
@@ -786,7 +815,7 @@ def update_case(
             CaseActivityLog(
                 case_id=case.id,
                 event_type="assignment",
-                actor_email=user.email,
+                actor_email=principal.email,
                 meta={"from": previous_assignee, "to": case.assignee},
             )
         )
@@ -796,7 +825,7 @@ def update_case(
             CaseActivityLog(
                 case_id=case.id,
                 event_type="sla",
-                actor_email=user.email,
+                actor_email=principal.email,
                 meta={
                     "from": previous_sla,
                     "to": case.sla_hours,
@@ -811,7 +840,9 @@ def update_case(
 
 @router.post("", response_model=CaseOut, status_code=201)
 def create_case(
-    payload: CaseCreate, db: Session = Depends(get_db), user=Depends(require_permission("case:create"))
+    payload: CaseCreate,
+    db: Session = Depends(get_db),
+    principal: Principal = Depends(require_permission("case:create")),
 ):
     title = payload.title.strip()
     if len(title) < 6 or len(title) > 140:
@@ -824,9 +855,7 @@ def create_case(
         raise HTTPException(status_code=400, detail="Summary must be 20+ chars")
     if payload.recommendation and len(payload.recommendation.strip()) < 20:
         raise HTTPException(status_code=400, detail="Recommendation must be 20+ chars")
-    dataset = db.query(Dataset).filter(Dataset.id == payload.dataset_id).first()
-    if not dataset:
-        raise HTTPException(status_code=400, detail="Dataset not found")
+    dataset = get_scoped_dataset(db, principal, payload.dataset_id)
     due_date, sla_hours = _compute_due_date(
         payload.severity,
         payload.sla_hours,
@@ -846,6 +875,7 @@ def create_case(
         assignee = pick_assignee(db, dataset)
     case = Case(
         dataset_id=payload.dataset_id,
+        demo_session_id=principal.demo_session_id,
         title=title,
         severity=payload.severity,
         status=payload.status,
@@ -868,7 +898,7 @@ def create_case(
             case_id=case.id,
             from_status=None,
             to_status=case.status,
-            actor_email=user.email,
+            actor_email=principal.email,
             reason=payload.status_reason
             or payload.blocked_reason
             or payload.escalated_reason,
@@ -879,7 +909,7 @@ def create_case(
             CaseActivityLog(
                 case_id=case.id,
                 event_type="assignment",
-                actor_email=user.email,
+                actor_email=principal.email,
                 meta={"from": None, "to": case.assignee},
             )
         )
@@ -892,12 +922,10 @@ def add_note(
     case_id: int,
     payload: CaseNoteCreate,
     db: Session = Depends(get_db),
-    user=Depends(require_permission("case:add_note")),
+    principal: Principal = Depends(require_permission("case:add_note")),
 ):
-    case = db.query(Case).filter(Case.id == case_id).first()
-    if not case:
-        raise HTTPException(status_code=404, detail="Case not found")
-    note = CaseNote(case_id=case_id, author=user.email, note=payload.note)
+    case = get_scoped_case(db, principal, case_id)
+    note = CaseNote(case_id=case_id, author=principal.email, note=payload.note)
     db.add(note)
     db.commit()
     db.refresh(note)

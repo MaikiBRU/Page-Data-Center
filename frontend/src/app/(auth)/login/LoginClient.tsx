@@ -1,5 +1,7 @@
 "use client";
 
+import Link from "next/link";
+
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { apiFetch, API_URL } from "@/lib/api";
@@ -232,24 +234,38 @@ export default function LoginClient({ initialClientId }: LoginClientProps) {
     <div className="mx-auto grid w-full max-w-5xl gap-10 lg:grid-cols-[1.1fr_0.9fr]">
       <div className="panel flex flex-col gap-6">
         <div>
-          <p className="text-xs uppercase tracking-[0.3em] text-white/40">
+          <p className="text-xs uppercase tracking-[0.3em] text-white/55">
             Calidad de datos
           </p>
-          <h1 className="mt-3 text-3xl font-semibold">Control Center</h1>
-          <p className="mt-3 text-sm text-[var(--muted)]">
-            Monitoreo de calidad, anomalías y acciones recomendadas para ecommerce
-            y logística. Unificá datos críticos y operativos en un solo panel.
+          <h1 className="mt-3 text-3xl font-semibold tracking-tight">Data Center</h1>
+          <p className="mt-3 text-sm leading-relaxed text-white/75">
+            Monitoreo de calidad, anomalías y acciones recomendadas sobre datos de
+            ecommerce y logística.
           </p>
         </div>
-        <div className="grid gap-4 rounded-2xl border border-white/10 bg-white/5 p-5 text-sm text-white/70">
+        <div className="grid gap-4 rounded-2xl border border-white/10 bg-white/5 p-5 text-sm text-white/75">
           <div>
-            <p className="text-xs uppercase tracking-[0.3em] text-white/40">Focus</p>
+            <p className="text-xs uppercase tracking-[0.3em] text-white/55">Qué revisa</p>
             <p className="mt-2">Direcciones, stock, precios y tiempos de entrega.</p>
           </div>
           <div>
-            <p className="text-xs uppercase tracking-[0.3em] text-white/40">Valor</p>
-            <p className="mt-2">Reduce errores y acelera decisiones internas.</p>
+            <p className="text-xs uppercase tracking-[0.3em] text-white/55">Para qué</p>
+            <p className="mt-2">
+              Detectar registros inválidos antes de que rompan la operación.
+            </p>
           </div>
+        </div>
+
+        {/* Anyone arriving here from the portfolio has no credentials: without
+            this the login screen is a dead end for them. */}
+        <div className="mt-auto rounded-2xl border border-[var(--accent)]/30 bg-[var(--accent)]/10 p-5">
+          <p className="text-sm font-medium text-white">¿No tenés cuenta?</p>
+          <p className="mt-1 text-sm text-white/75">
+            Podés recorrer la aplicación completa sin registrarte.
+          </p>
+          <Link className="btn-primary mt-4 w-full sm:w-auto" href="/demo">
+            Probar la demo
+          </Link>
         </div>
       </div>
 
@@ -280,7 +296,7 @@ export default function LoginClient({ initialClientId }: LoginClientProps) {
         </label>
         {mode !== "set_password" && (
           <label className="text-sm text-white/70">
-            Password
+            Contraseña
             <input
               className="input-base mt-2"
               type="password"
@@ -294,9 +310,12 @@ export default function LoginClient({ initialClientId }: LoginClientProps) {
         {mode === "login" && (
           <div className="flex items-center justify-between text-xs text-white/60">
             <span>¿Olvidaste tu contraseña?</span>
-            <a className="text-[var(--accent-2)] hover:text-white" href="/forgot-password">
+            <Link
+              className="text-[var(--accent-2)] underline-offset-4 transition hover:text-white hover:underline"
+              href="/forgot-password"
+            >
               Recuperar acceso
-            </a>
+            </Link>
           </div>
         )}
         {mode === "set_password" && (

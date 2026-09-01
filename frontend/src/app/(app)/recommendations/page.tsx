@@ -1,15 +1,20 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { apiFetch } from "@/lib/api";
 import { getToken } from "@/lib/auth";
+import { entryPath } from "@/lib/demo";
 import Link from "next/link";
 import { emitToast } from "@/lib/toast";
-import { FlowSteps } from "@/components/FlowSteps";
+import { can } from "@/lib/permissions";
+import { severityLabel, severityTone } from "@/lib/vocabulary";
+import { formatNumber } from "@/lib/format";
 import { OnboardingCoach } from "@/components/OnboardingCoach";
 import { useFlowData } from "@/lib/flow";
 import { EmptyState } from "@/components/EmptyState";
+import { ErrorState } from "@/components/ErrorState";
+import { useEscapeKey } from "@/lib/useEscapeKey";
 
 interface Dataset {
   id: number;
@@ -32,31 +37,28 @@ type Recommendation = {
   domain?: string;
 };
 
-const baseValue = (domain?: string) => {
-  if (domain === "ecommerce") return 120;
-  if (domain === "logistica") return 90;
-  if (domain === "ecommerce-logistica") return 110;
-  return 100;
-};
+/**
+ * Priority weight per severity. There is no cost model behind this and no
+ * currency: it exists only to rank recommendations against each other, so a
+ * finding on 400 high-severity rows outranks one on 400 low-severity rows.
+ *
+ * A previous version multiplied this by a hardcoded "value per row" (90, 110
+ * or 120 depending on the domain) and rendered the product as US dollars. That
+ * figure was invented -- the dataset carries no monetary information -- so it
+ * is gone.
+ */
+const SEVERITY_WEIGHT: Record<string, number> = { high: 1, medium: 0.6, low: 0.3 };
 
 const riskPointsFor = (rec: Recommendation) => {
   const count = rec.count ?? 0;
-  const severity = rec.severity ?? "medium";
-  const weight = severity === "high" ? 1 : severity === "low" ? 0.3 : 0.6;
-  return count * weight;
-};
-
-const impactFor = (rec: Recommendation) => {
-  const count = rec.count ?? 0;
-  const severity = rec.severity ?? "medium";
-  const weight = severity === "high" ? 1 : severity === "low" ? 0.3 : 0.6;
-  return count * weight * baseValue(rec.domain);
+  return count * (SEVERITY_WEIGHT[rec.severity ?? "medium"] ?? 0.6);
 };
 
 export default function RecommendationsPage() {
   const router = useRouter();
   const [recommendations, setRecommendations] = useState<Recommendation[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [me, setMe] = useState<{ is_admin: boolean; role?: string } | null>(null);
   const [search, setSearch] = useState("");
   const [priorityFilter, setPriorityFilter] = useState("");
@@ -74,19 +76,8 @@ export default function RecommendationsPage() {
   const [showBulkConfirm, setShowBulkConfirm] = useState(false);
   const flow = useFlowData();
 
-  useEffect(() => {
-    if (!getToken()) {
-      router.push("/login");
-      return;
-    }
-    apiFetch<{ is_admin: boolean; role?: string }>("/auth/me")
-      .then(setMe)
-      .catch(() => setMe(null));
-    apiFetch<{ id: number; email: string; role: string; is_admin: boolean }[]>(
-      "/users/assignable"
-    )
-      .then(setAssignableUsers)
-      .catch(() => setAssignableUsers([]));
+  const loadRecommendations = useCallback(() => {
+    setLoading(true);
     apiFetch<Dataset[]>("/datasets")
       .then((datasets) => {
         const collected: Recommendation[] = [];
@@ -102,12 +93,38 @@ export default function RecommendationsPage() {
           );
         });
         setRecommendations(collected);
+        setLoadError(null);
       })
-      .catch(() => null)
+      .catch((err: Error) => setLoadError(err.message))
       .finally(() => setLoading(false));
-  }, [router]);
+  }, []);
 
-  const canEdit = me?.is_admin || me?.role === "analyst";
+  useEffect(() => {
+    if (!getToken()) {
+      router.push(entryPath());
+      return;
+    }
+    apiFetch<{ is_admin: boolean; role?: string }>("/auth/me")
+      .then(setMe)
+      .catch(() => setMe(null));
+    loadRecommendations();
+  }, [router, loadRecommendations]);
+
+  // /users/assignable is analyst-and-up: firing it for a demo visitor only
+  // produced a 403 in their console. It waits until the role is known.
+  useEffect(() => {
+    if (!can(me, "users:assignable")) {
+      setAssignableUsers([]);
+      return;
+    }
+    apiFetch<{ id: number; email: string; role: string; is_admin: boolean }[]>(
+      "/users/assignable"
+    )
+      .then(setAssignableUsers)
+      .catch(() => setAssignableUsers([]));
+  }, [me]);
+
+  const canEdit = can(me, "case:create");
   const slaSelectValue =
     slaMode === "custom" ? "custom" : slaHours !== "" ? String(slaHours) : "";
 
@@ -139,9 +156,8 @@ export default function RecommendationsPage() {
   const aggregateImpact = useMemo(() => {
     const list = selectedList.length > 0 ? selectedList : filtered;
     const totalCount = list.reduce((acc, rec) => acc + (rec.count ?? 0), 0);
-    const impact = list.reduce((acc, rec) => acc + impactFor(rec), 0);
     const risk = list.reduce((acc, rec) => acc + riskPointsFor(rec), 0);
-    return { totalCount, impact, risk };
+    return { totalCount, risk };
   }, [filtered, selectedList]);
 
   const totalRisk = useMemo(() => {
@@ -166,27 +182,25 @@ export default function RecommendationsPage() {
 
   const priorityImpact = useMemo(() => {
     const list = selectedList.length > 0 ? selectedList : filtered;
-    const base = { alta: { risk: 0, impact: 0 }, media: { risk: 0, impact: 0 }, baja: { risk: 0, impact: 0 } };
+    const base = { alta: { risk: 0 }, media: { risk: 0 }, baja: { risk: 0 } };
     list.forEach((rec) => {
       const key = (rec.priority as "alta" | "media" | "baja") ?? "baja";
       base[key].risk += riskPointsFor(rec);
-      base[key].impact += impactFor(rec);
     });
     return base;
   }, [filtered, selectedList]);
 
   const datasetImpact = useMemo(() => {
     const list = selectedList.length > 0 ? selectedList : filtered;
-    const map = new Map<string, { dataset: string; count: number; risk: number; impact: number }>();
+    const map = new Map<string, { dataset: string; count: number; risk: number }>();
     list.forEach((rec) => {
       const key = `${rec.dataset_id}-${rec.dataset}`;
       if (!map.has(key)) {
-        map.set(key, { dataset: rec.dataset, count: 0, risk: 0, impact: 0 });
+        map.set(key, { dataset: rec.dataset, count: 0, risk: 0 });
       }
       const row = map.get(key)!;
       row.count += rec.count ?? 0;
       row.risk += riskPointsFor(rec);
-      row.impact += impactFor(rec);
     });
     return Array.from(map.values()).sort((a, b) => b.risk - a.risk);
   }, [filtered, selectedList]);
@@ -197,16 +211,9 @@ export default function RecommendationsPage() {
     return Array.from(map.entries()).map(([id, name]) => ({ id, name }));
   }, [recommendations]);
 
-  const badgeClass = (priority?: string) => {
-    switch (priority) {
-      case "alta":
-        return "border-[var(--danger)]/50 bg-[var(--danger)]/10 text-[var(--danger)]";
-      case "media":
-        return "border-[var(--warning)]/50 bg-[var(--warning)]/10 text-[var(--warning)]";
-      default:
-        return "border-[var(--success)]/50 bg-[var(--success)]/10 text-[var(--success)]";
-    }
-  };
+  // Priority here is the same idea Cases calls severity, so it uses the
+  // same palette. Low used to be green, which read as "this one is fine".
+  const badgeClass = severityTone;
 
   const createCaseFromRec = async (rec: Recommendation, silent = false) => {
     if (!canEdit) {
@@ -327,14 +334,15 @@ export default function RecommendationsPage() {
     }
   };
 
+  // Every overlay in the app was mouse-only; Escape now closes them.
+  useEscapeKey(Boolean(showBulkConfirm), () => setShowBulkConfirm(false));
+
   return (
     <div className="flex flex-col gap-8">
       <div>
-        <p className="text-xs uppercase tracking-[0.3em] text-white/40">Acciones</p>
+        <p className="text-xs uppercase tracking-[0.3em] text-white/55">Acciones</p>
         <h2 className="mt-2 text-3xl font-semibold">Recomendaciones</h2>
       </div>
-
-      <FlowSteps flow={flow} />
 
       <OnboardingCoach
         flow={flow}
@@ -347,8 +355,8 @@ export default function RecommendationsPage() {
 
       <section className="panel grid gap-4 md:grid-cols-[1.2fr_0.8fr] items-center">
         <div>
-          <p className="text-xs uppercase tracking-[0.3em] text-white/40">Resumen</p>
-          <h3 className="mt-2 text-lg font-semibold">Acciones priorizadas</h3>
+          <p className="text-xs uppercase tracking-[0.3em] text-white/55">Resumen</p>
+          <h3 className="mt-2 text-xl font-semibold">Acciones priorizadas</h3>
           <p className="mt-2 text-sm text-[var(--muted)]">
             Filtrá por prioridad o dataset y convertí recomendaciones en casos.
           </p>
@@ -363,12 +371,15 @@ export default function RecommendationsPage() {
       <section className="panel grid gap-4 md:grid-cols-3">
         <input
           className="input-base"
+          type="search"
+          aria-label="Buscar recomendaciones por código o dataset"
           placeholder="Buscar por código o dataset"
           value={search}
           onChange={(event) => setSearch(event.target.value)}
         />
         <select
           className="input-base"
+          aria-label="Filtrar por prioridad"
           value={priorityFilter}
           onChange={(event) => setPriorityFilter(event.target.value)}
         >
@@ -379,6 +390,7 @@ export default function RecommendationsPage() {
         </select>
         <select
           className="input-base"
+          aria-label="Filtrar por dataset"
           value={datasetFilter}
           onChange={(event) => setDatasetFilter(event.target.value)}
         >
@@ -394,44 +406,43 @@ export default function RecommendationsPage() {
       <section className="panel" id="batch-actions">
         <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
           <div>
-            <p className="text-xs uppercase tracking-[0.3em] text-white/40">Impacto agregado</p>
+            <p className="text-xs uppercase tracking-[0.3em] text-white/55">Peso agregado</p>
             <p className="mt-2 text-sm text-[var(--muted)]">
               {selectedList.length > 0
                 ? `Resumen de ${selectedList.length} seleccionadas.`
                 : "Resumen de resultados filtrados."}
             </p>
-            <p className="mt-1 text-xs text-[var(--muted)]">
-              Riesgo reducido estimado: {riskReductionPct}% del total.
+            <p className="mt-1 text-xs text-white/70">
+              El filtro actual cubre el {riskReductionPct}% del peso total.
             </p>
           </div>
           <div className="flex flex-wrap gap-3 text-xs">
-            <span className="badge">Registros: {aggregateImpact.totalCount}</span>
             <span className="badge">
-              Impacto:{" "}
-              {new Intl.NumberFormat("es-AR", {
-                style: "currency",
-                currency: "USD",
-                maximumFractionDigits: 0,
-              }).format(aggregateImpact.impact)}
+              {formatNumber(aggregateImpact.totalCount)} filas
             </span>
-            <span className="badge">Riesgo: {aggregateImpact.risk.toFixed(1)}</span>
+            <span className="badge">
+              Peso {aggregateImpact.risk.toFixed(1)}
+            </span>
           </div>
         </div>
         <div className="grid gap-4 md:grid-cols-3">
           <div className="card-box">
-            <p className="text-xs uppercase tracking-[0.3em] text-white/40">Riesgo aplicado</p>
+            <p className="text-xs uppercase tracking-[0.3em] text-white/55">Peso en foco</p>
             <p className="mt-2 text-lg font-semibold">{appliedRisk.toFixed(1)}</p>
-            <p className="text-xs text-[var(--muted)]">
-              Acciones cubiertas {selectedList.length > 0 ? selectedList.length : filtered.length}
+            <p className="mt-1 text-xs text-white/70">
+              {selectedList.length > 0 ? selectedList.length : filtered.length} de{" "}
+              {recommendations.length} recomendaciones
             </p>
           </div>
           <div className="card-box">
-            <p className="text-xs uppercase tracking-[0.3em] text-white/40">Riesgo restante</p>
+            <p className="text-xs uppercase tracking-[0.3em] text-white/55">Peso fuera del filtro</p>
             <p className="mt-2 text-lg font-semibold">{remainingRisk.toFixed(1)}</p>
-            <p className="text-xs text-[var(--muted)]">Base total {totalRisk.toFixed(1)}</p>
+            <p className="mt-1 text-xs text-white/70">
+              Sobre un total de {totalRisk.toFixed(1)}
+            </p>
           </div>
           <div className="card-box">
-            <p className="text-xs uppercase tracking-[0.3em] text-white/40">Reducción total</p>
+            <p className="text-xs uppercase tracking-[0.3em] text-white/55">Cobertura</p>
             <p className="mt-2 text-lg font-semibold">{riskReductionPct}%</p>
             <div className="mt-3 h-2 w-full rounded-full bg-white/10">
               <div
@@ -439,50 +450,39 @@ export default function RecommendationsPage() {
                 style={{ width: `${riskReductionPct}%` }}
               />
             </div>
+            <p className="mt-2 text-xs leading-snug text-white/70">
+              Peso = filas afectadas x severidad (alta 1, media 0,6, baja 0,3).
+              No es una estimacion de costo.
+            </p>
           </div>
         </div>
         <div className="mt-4 grid gap-4 lg:grid-cols-[1fr_1.4fr]">
           <div className="card-box text-xs text-white/70">
-            <p className="text-xs uppercase tracking-[0.3em] text-white/40">Por prioridad</p>
+            <p className="text-xs uppercase tracking-[0.3em] text-white/55">Por prioridad</p>
             <div className="mt-3 grid gap-2">
               <div className="flex items-center justify-between">
                 <span>Alta</span>
-                <span>
-                  Riesgo {priorityImpact.alta.risk.toFixed(1)} ·{" "}
-                  {new Intl.NumberFormat("es-AR", {
-                    style: "currency",
-                    currency: "USD",
-                    maximumFractionDigits: 0,
-                  }).format(priorityImpact.alta.impact)}
+                <span className="tabular-nums">
+                  Peso {priorityImpact.alta.risk.toFixed(1)}
                 </span>
               </div>
               <div className="flex items-center justify-between">
                 <span>Media</span>
-                <span>
-                  Riesgo {priorityImpact.media.risk.toFixed(1)} ·{" "}
-                  {new Intl.NumberFormat("es-AR", {
-                    style: "currency",
-                    currency: "USD",
-                    maximumFractionDigits: 0,
-                  }).format(priorityImpact.media.impact)}
+                <span className="tabular-nums">
+                  Peso {priorityImpact.media.risk.toFixed(1)}
                 </span>
               </div>
               <div className="flex items-center justify-between">
                 <span>Baja</span>
-                <span>
-                  Riesgo {priorityImpact.baja.risk.toFixed(1)} ·{" "}
-                  {new Intl.NumberFormat("es-AR", {
-                    style: "currency",
-                    currency: "USD",
-                    maximumFractionDigits: 0,
-                  }).format(priorityImpact.baja.impact)}
+                <span className="tabular-nums">
+                  Peso {priorityImpact.baja.risk.toFixed(1)}
                 </span>
               </div>
             </div>
           </div>
           <div className="card-box text-xs text-white/70">
-            <p className="text-xs uppercase tracking-[0.3em] text-white/40">
-              Datasets con mayor riesgo
+            <p className="text-xs uppercase tracking-[0.3em] text-white/55">
+              Datasets con mayor peso
             </p>
             {datasetImpact.length === 0 ? (
               <p className="mt-3 text-xs text-[var(--muted)]">Sin datos.</p>
@@ -491,14 +491,7 @@ export default function RecommendationsPage() {
                 {datasetImpact.slice(0, 5).map((row) => (
                   <div key={row.dataset} className="flex items-center justify-between">
                     <span>{row.dataset}</span>
-                    <span>
-                      Riesgo {row.risk.toFixed(1)} ·{" "}
-                      {new Intl.NumberFormat("es-AR", {
-                        style: "currency",
-                        currency: "USD",
-                        maximumFractionDigits: 0,
-                      }).format(row.impact)}
-                    </span>
+                    <span className="tabular-nums">Peso {row.risk.toFixed(1)}</span>
                   </div>
                 ))}
               </div>
@@ -511,6 +504,8 @@ export default function RecommendationsPage() {
               <div key={`rec-skel-${idx}`} className="skeleton h-16" />
             ))}
           </div>
+        ) : loadError ? (
+          <ErrorState message={loadError} onRetry={loadRecommendations} />
         ) : filtered.length === 0 ? (
           <EmptyState
             title={
@@ -532,7 +527,7 @@ export default function RecommendationsPage() {
           <div className="grid gap-3">
             <div className="card-box flex flex-wrap items-center justify-between gap-3 text-xs text-white/70">
               <div>
-                <p className="text-xs uppercase tracking-[0.3em] text-white/40">
+                <p className="text-xs uppercase tracking-[0.3em] text-white/55">
                   Asignación al crear casos
                 </p>
                 <p className="mt-2 text-xs text-[var(--muted)]">
@@ -556,7 +551,7 @@ export default function RecommendationsPage() {
             </div>
             <div className="card-box flex flex-wrap items-center gap-3 text-xs text-white/70">
               <div className="min-w-[220px]">
-                <p className="text-xs uppercase tracking-[0.3em] text-white/40">
+                <p className="text-xs uppercase tracking-[0.3em] text-white/55">
                   Estado al crear
                 </p>
                 <select
@@ -571,7 +566,7 @@ export default function RecommendationsPage() {
                 </select>
               </div>
               <div className="min-w-[220px]">
-                <p className="text-xs uppercase tracking-[0.3em] text-white/40">SLA</p>
+                <p className="text-xs uppercase tracking-[0.3em] text-white/55">SLA</p>
                 <select
                   className="input-base mt-2"
                   value={slaSelectValue}
@@ -604,7 +599,7 @@ export default function RecommendationsPage() {
               </div>
               {slaSelectValue === "custom" && (
                 <div className="min-w-[220px]">
-                  <p className="text-xs uppercase tracking-[0.3em] text-white/40">
+                  <p className="text-xs uppercase tracking-[0.3em] text-white/55">
                     SLA personalizado
                   </p>
                   <input
@@ -676,14 +671,10 @@ export default function RecommendationsPage() {
                     </span>
                   )}
                   <span className={`badge ${badgeClass(rec.priority)}`}>
-                    {(rec.priority ?? "baja").toUpperCase()}
+                    {severityLabel(rec.priority ?? "baja")}
                   </span>
                   <span className="rounded-full border border-white/15 bg-white/5 px-2 py-0.5 text-white/70">
-                    Impacto {new Intl.NumberFormat("es-AR", {
-                      style: "currency",
-                      currency: "USD",
-                      maximumFractionDigits: 0,
-                    }).format(impactFor(rec))}
+                    Peso {riskPointsFor(rec).toFixed(1)}
                   </span>
                 </div>
                 </div>
@@ -714,11 +705,11 @@ export default function RecommendationsPage() {
       {showBulkConfirm && (
         <div className="modal-backdrop" onClick={() => setShowBulkConfirm(false)}>
           <div
-            className="modal-panel max-w-2xl space-y-4"
+            role="dialog" aria-modal="true" className="modal-panel max-w-2xl space-y-4"
             onClick={(event) => event.stopPropagation()}
           >
             <div>
-              <p className="text-xs uppercase tracking-[0.3em] text-white/40">Batch</p>
+              <p className="text-xs uppercase tracking-[0.3em] text-white/55">Batch</p>
               <h3 className="mt-2 text-xl font-semibold">Confirmar creación en lote</h3>
               <p className="mt-2 text-sm text-[var(--muted)]">
                 Vas a crear {selectedList.length} casos con estas reglas:
@@ -748,13 +739,9 @@ export default function RecommendationsPage() {
                 </p>
               </div>
               <div className="card-box">
-                <p className="text-white/50">Impacto</p>
+                <p className="text-white/55">Peso</p>
                 <p className="mt-1 font-semibold">
-                  {new Intl.NumberFormat("es-AR", {
-                    style: "currency",
-                    currency: "USD",
-                    maximumFractionDigits: 0,
-                  }).format(aggregateImpact.impact)}
+                  {aggregateImpact.risk.toFixed(1)}
                 </p>
                 <p className="mt-1 text-[var(--muted)]">
                   Riesgo reducido {riskReductionPct}%

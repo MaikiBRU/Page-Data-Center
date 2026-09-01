@@ -19,11 +19,16 @@ App Runner settings:
 - Source directory: `backend`
 - Dockerfile: `Dockerfile`
 - Port: `8000`
-- Health check path: `/`
+- Health check path: `/health` (verifies the database connection; `/` only
+  reports that the process is up)
+
+The container entrypoint runs `alembic upgrade head` before uvicorn, so schema
+changes are applied before the API accepts traffic.
 
 Required environment variables:
 
 ```env
+ENVIRONMENT=production
 SECRET_KEY=<generate-a-long-random-secret>
 DATABASE_URL=postgresql+psycopg://<user>:<password>@<rds-endpoint>:5432/<database>
 ALLOWED_ORIGINS=https://datacenter.aaronbrumat.com.ar
@@ -33,7 +38,30 @@ GOOGLE_CLIENT_ID=
 GOOGLE_CLIENT_SECRET=
 SENDGRID_API_KEY=
 EMAIL_FROM=no-reply@aaronbrumat.com.ar
+
+# Demo sandbox. See DEMO.md for the full table and the reasoning behind
+# each limit. The defaults are usable as-is; set the maintenance token only
+# if you want to drive cleanup from outside the process.
+DEMO_ENABLED=true
+DEMO_MAINTENANCE_TOKEN=<generate-a-long-random-secret-or-leave-unset>
 ```
+
+Cleanup of expired sandboxes runs inside the API process on a timer
+(`DEMO_CLEANUP_INTERVAL_SECONDS`, default 300s), so no scheduler is required.
+Expired sessions are rejected at request time regardless of whether cleanup has
+run yet.
+
+`ENVIRONMENT=production` turns off `/docs`, `/redoc` and `/openapi.json`, and
+forces the password reset link never to be written to a log. Both are on by
+default in development.
+
+`SECRET_KEY` is required and has no default: the service will not start
+without it.
+
+Brute force protection on `/auth/login` and `/auth/forgot-password` is
+in-process. On a single instance the limits are exact; if App Runner scales to
+several instances each keeps its own counters, so the effective allowance
+multiplies by the instance count. Redis was judged not worth adding for this.
 
 After App Runner is live, create a Cloudflare DNS record:
 
@@ -75,4 +103,29 @@ curl.exe -I https://api-datacenter.aaronbrumat.com.ar/
 curl.exe -I https://datacenter.aaronbrumat.com.ar/
 ```
 
-The backend root should return `200 OK`. The frontend should load the login page and API calls should use `https://api-datacenter.aaronbrumat.com.ar`.
+The backend root should return `200 OK`. The frontend root redirects an
+anonymous visitor to `/demo` (not to the login page), and API calls should
+use `https://api-datacenter.aaronbrumat.com.ar`.
+
+Demo sandbox:
+
+```powershell
+curl.exe https://api-datacenter.aaronbrumat.com.ar/health
+curl.exe https://api-datacenter.aaronbrumat.com.ar/demo/config
+curl.exe -I https://datacenter.aaronbrumat.com.ar/demo
+```
+
+`/health` should report `database: true`, `/demo/config` should return the
+configured limits, and `/dashboard` without a session should redirect to
+`/demo` rather than rendering the application shell.
+
+## Portfolio link
+
+Point the portfolio's "Visualizar app" button at:
+
+```text
+https://datacenter.aaronbrumat.com.ar/demo
+```
+
+`/dashboard` also works — an anonymous visitor is redirected to `/demo` — but
+linking `/demo` directly avoids the extra hop.

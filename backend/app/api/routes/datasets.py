@@ -1,9 +1,8 @@
-from datetime import datetime, timedelta
+from datetime import datetime
 from html import escape
 import csv
 import io
 import math
-import time
 from typing import Any
 from pathlib import Path
 
@@ -11,8 +10,16 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, get_db, require_permission
-from app.models.case import Case
+from app.api.deps import (
+    Principal,
+    demo_quota_error,
+    get_db,
+    get_principal,
+    get_scoped_dataset,
+    require_permission,
+    scope_datasets,
+)
+from app.core.config import settings
 from app.models.dataset import Dataset
 from app.models.dataset_run import DatasetRun
 from app.models.user import User
@@ -26,16 +33,22 @@ from app.schemas.dataset import (
     DatasetRulesUpdate,
     DatasetRunResponse,
 )
-from app.services.assignment import ASSIGNMENT_MODES, pick_assignee
-from app.services.data_generator import generate_dataset
-from app.services.data_quality import (
-    DOMAIN_RULES,
-    RULES_CATALOG,
-    load_records,
-    recommend_actions,
-    run_anomaly_detection,
-    run_quality_checks,
+from app.services import demo_session as demo_service
+from app.services.assignment import ASSIGNMENT_MODES
+from app.services.data_generator import generate_dataset, generate_dataset_csv
+from app.services.data_quality import DOMAIN_RULES, RULES_CATALOG
+from app.services.dataset_storage import (
+    DatasetPayloadMissing,
+    InvalidUpload,
+    dataset_has_payload,
+    demo_file_size,
+    open_dataset_text,
+    safe_filename,
+    store_demo_file,
+    validate_csv_bytes,
 )
+from app.services.quality_run import compute_scores, execute_quality_run, rule_violations
+from app.services.schema_check import check_schema
 
 router = APIRouter(prefix="/datasets", tags=["datasets"])
 BASE_DIR = Path(__file__).resolve().parents[4]
@@ -43,27 +56,42 @@ UPLOAD_DIR = BASE_DIR / "data" / "uploads"
 
 _PREVIEW_LIMIT = 20
 _STATS_LIMIT = 200
+_UPLOAD_CHUNK = 64 * 1024
+# Hard ceiling for authenticated uploads. Demo uploads are additionally capped
+# by DEMO_MAX_FILE_SIZE_MB, which is smaller.
+_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
 
-def _case_due_date(severity: str, domain: str) -> tuple[datetime, int]:
-    matrix = {
-        "default": {"high": 24, "medium": 48, "low": 72},
-        "ecommerce": {"high": 18, "medium": 40, "low": 72},
-        "logistica": {"high": 12, "medium": 36, "low": 72},
-        "ecommerce-logistica": {"high": 16, "medium": 40, "low": 80},
-    }
-    rules = matrix.get(domain, matrix["default"])
-    sla_hours = rules.get(severity, matrix["default"]["medium"])
-    return datetime.utcnow() + timedelta(hours=sla_hours), sla_hours
+def _demo_generate_rows_cap() -> int:
+    """Row ceiling for generated demo datasets, derived from the size quota.
+
+    A generated row is roughly 185 bytes, measured on the existing fixtures.
+    """
+    return max(50, int(settings.demo_max_file_size_bytes / 185))
 
 
 @router.post("", response_model=DatasetOut)
 def create_dataset(
     payload: DatasetCreate,
     db: Session = Depends(get_db),
-    user=Depends(require_permission("dataset:create")),
+    principal: Principal = Depends(require_permission("dataset:create")),
 ):
-    dataset = Dataset(name=payload.name, domain=payload.domain, source_type="upload", created_by=user.id)
+    if principal.is_demo:
+        try:
+            demo_service.assert_can_add_dataset(db, principal.demo)
+        except demo_service.DemoQuotaExceeded as exc:
+            raise demo_quota_error(exc) from None
+
+    if payload.domain not in DOMAIN_RULES:
+        raise HTTPException(status_code=400, detail="Dominio invalido")
+
+    dataset = Dataset(
+        name=payload.name.strip()[:255] or "Dataset",
+        domain=payload.domain,
+        source_type="upload",
+        created_by=principal.user_id,
+        demo_session_id=principal.demo_session_id,
+    )
     db.add(dataset)
     db.commit()
     db.refresh(dataset)
@@ -75,11 +103,9 @@ def update_dataset_domain(
     dataset_id: int,
     payload: DatasetDomainUpdate,
     db: Session = Depends(get_db),
-    user=Depends(require_permission("dataset:edit_domain")),
+    principal: Principal = Depends(require_permission("dataset:edit_domain")),
 ):
-    dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
-    if not dataset:
-        raise HTTPException(status_code=404, detail="Dataset not found")
+    dataset = get_scoped_dataset(db, principal, dataset_id)
     dataset.domain = payload.domain
     if dataset.rules_config and dataset.rules_config.get("disabled_rules"):
         allowed = set(DOMAIN_RULES.get(payload.domain, []))
@@ -93,7 +119,7 @@ def update_dataset_domain(
 
 
 @router.get("/rules")
-def list_rules(user=Depends(get_current_user)):
+def list_rules(principal: Principal = Depends(get_principal)):
     return {"catalog": RULES_CATALOG, "profiles": DOMAIN_RULES}
 
 
@@ -102,11 +128,9 @@ def update_dataset_rules(
     dataset_id: int,
     payload: DatasetRulesUpdate,
     db: Session = Depends(get_db),
-    user=Depends(require_permission("dataset:edit_rules")),
+    principal: Principal = Depends(require_permission("dataset:edit_rules")),
 ):
-    dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
-    if not dataset:
-        raise HTTPException(status_code=404, detail="Dataset not found")
+    dataset = get_scoped_dataset(db, principal, dataset_id)
     allowed = set(DOMAIN_RULES.get(dataset.domain, []))
     invalid = [rule for rule in payload.disabled_rules if rule not in allowed]
     if invalid:
@@ -122,11 +146,9 @@ def update_dataset_assignment(
     dataset_id: int,
     payload: DatasetAssignmentUpdate,
     db: Session = Depends(get_db),
-    user=Depends(require_permission("dataset:edit_assignment")),
+    principal: Principal = Depends(require_permission("dataset:edit_assignment")),
 ):
-    dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
-    if not dataset:
-        raise HTTPException(status_code=404, detail="Dataset not found")
+    dataset = get_scoped_dataset(db, principal, dataset_id)
     mode = (payload.mode or "manual").strip()
     if mode not in ASSIGNMENT_MODES:
         raise HTTPException(status_code=400, detail="Invalid assignment mode")
@@ -135,9 +157,7 @@ def update_dataset_assignment(
         if not owner:
             raise HTTPException(status_code=400, detail="Owner required for owner mode")
         owner_row = (
-            db.query(User)
-            .filter(User.email == owner, User.is_active == True)  # noqa: E712
-            .first()
+            db.query(User).filter(User.email == owner, User.is_active.is_(True)).first()
         )
         if not owner_row:
             raise HTTPException(status_code=400, detail="Owner must be an active user")
@@ -151,16 +171,36 @@ def update_dataset_assignment(
 
 
 @router.get("", response_model=list[DatasetDetail])
-def list_datasets(db: Session = Depends(get_db), user=Depends(get_current_user)):
-    return db.query(Dataset).order_by(Dataset.created_at.desc()).all()
+def list_datasets(db: Session = Depends(get_db), principal: Principal = Depends(get_principal)):
+    query = scope_datasets(db.query(Dataset), principal)
+    return query.order_by(Dataset.created_at.desc()).all()
 
 
 @router.get("/{dataset_id}", response_model=DatasetDetail)
-def get_dataset(dataset_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
-    dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
-    if not dataset:
-        raise HTTPException(status_code=404, detail="Dataset not found")
-    return dataset
+def get_dataset(
+    dataset_id: int, db: Session = Depends(get_db), principal: Principal = Depends(get_principal)
+):
+    return get_scoped_dataset(db, principal, dataset_id)
+
+
+def _read_upload(file: UploadFile, max_bytes: int) -> bytes:
+    """Stream the upload, aborting as soon as it exceeds the ceiling.
+
+    Reading in chunks means an oversized body is rejected without ever being
+    fully materialised in memory.
+    """
+    buffer = bytearray()
+    while True:
+        chunk = file.file.read(_UPLOAD_CHUNK)
+        if not chunk:
+            break
+        buffer.extend(chunk)
+        if len(buffer) > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"El archivo supera el maximo de {max_bytes // (1024 * 1024)} MB.",
+            )
+    return bytes(buffer)
 
 
 @router.post("/{dataset_id}/upload", response_model=DatasetDetail)
@@ -168,16 +208,48 @@ def upload_dataset(
     dataset_id: int,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
-    user=Depends(require_permission("dataset:upload")),
+    principal: Principal = Depends(require_permission("dataset:upload")),
 ):
-    dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
-    if not dataset:
-        raise HTTPException(status_code=404, detail="Dataset not found")
+    dataset = get_scoped_dataset(db, principal, dataset_id)
+
+    max_bytes = (
+        settings.demo_max_file_size_bytes if principal.is_demo else _MAX_UPLOAD_BYTES
+    )
+    content = _read_upload(file, max_bytes)
+
+    # The filename is attacker controlled: reduce it to a bare leaf name before
+    # it is used anywhere. The client-declared content type is not trusted
+    # either; the bytes themselves are parsed to confirm this is a CSV.
+    filename = safe_filename(file.filename)
+    try:
+        validate_csv_bytes(content)
+    except InvalidUpload as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+
+    if principal.is_demo:
+        session = principal.demo
+        # Replacing an existing file frees the space it used.
+        already = demo_file_size(db, dataset.id)
+        try:
+            demo_service.assert_storage_available(
+                session, max(0, len(content) - already)
+            )
+        except demo_service.DemoQuotaExceeded as exc:
+            raise demo_quota_error(exc) from None
+        store_demo_file(db, dataset, filename, content)
+        dataset.source_type = "upload"
+        db.commit()
+        demo_service.recalculate_storage(db, session)
+        db.refresh(dataset)
+        return dataset
 
     dataset_dir = UPLOAD_DIR / f"dataset_{dataset_id}"
     dataset_dir.mkdir(parents=True, exist_ok=True)
-    file_path = dataset_dir / file.filename
-    content = file.file.read()
+    file_path = (dataset_dir / filename).resolve()
+    # Defence in depth: even after sanitisation, refuse to write outside the
+    # dataset directory.
+    if not str(file_path).startswith(str(dataset_dir.resolve())):
+        raise HTTPException(status_code=400, detail="Nombre de archivo invalido")
     file_path.write_bytes(content)
 
     dataset.file_path = str(file_path)
@@ -192,16 +264,33 @@ def generate_dataset_file(
     dataset_id: int,
     payload: DatasetGenerateRequest,
     db: Session = Depends(get_db),
-    user=Depends(require_permission("dataset:generate")),
+    principal: Principal = Depends(require_permission("dataset:generate")),
 ):
-    dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
-    if not dataset:
-        raise HTTPException(status_code=404, detail="Dataset not found")
+    dataset = get_scoped_dataset(db, principal, dataset_id)
+
+    rows = max(1, int(payload.rows))
+    anomaly_rate = min(max(float(payload.anomaly_rate), 0.0), 0.9)
+
+    if principal.is_demo:
+        session = principal.demo
+        rows = min(rows, _demo_generate_rows_cap())
+        content = generate_dataset_csv(rows, anomaly_rate).encode("utf-8")
+        already = demo_file_size(db, dataset.id)
+        try:
+            demo_service.assert_storage_available(session, max(0, len(content) - already))
+        except demo_service.DemoQuotaExceeded as exc:
+            raise demo_quota_error(exc) from None
+        store_demo_file(db, dataset, "dataset-demo.csv", content)
+        dataset.source_type = "generated"
+        db.commit()
+        demo_service.recalculate_storage(db, session)
+        db.refresh(dataset)
+        return dataset
 
     dataset_dir = UPLOAD_DIR / f"dataset_{dataset_id}"
     dataset_dir.mkdir(parents=True, exist_ok=True)
     file_path = dataset_dir / "generated.csv"
-    generate_dataset(str(file_path), payload.rows, payload.anomaly_rate)
+    generate_dataset(str(file_path), rows, anomaly_rate)
 
     dataset.file_path = str(file_path)
     dataset.source_type = "generated"
@@ -214,94 +303,47 @@ def generate_dataset_file(
 def run_quality(
     dataset_id: int,
     db: Session = Depends(get_db),
-    user=Depends(require_permission("dataset:run_quality")),
+    principal: Principal = Depends(require_permission("dataset:run_quality")),
 ):
-    dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
-    if not dataset or not dataset.file_path:
-        raise HTTPException(status_code=404, detail="Dataset not found or no file uploaded")
-
-    started_at = time.perf_counter()
-    records = load_records(dataset.file_path)
-    rules_config = dataset.rules_config or {}
-    disabled_rules = rules_config.get("disabled_rules", [])
-    quality_summary, issues = run_quality_checks(
-        records, domain=dataset.domain, disabled_rules=disabled_rules
-    )
-    anomaly_summary = run_anomaly_detection(
-        records, domain=dataset.domain, disabled_rules=disabled_rules
-    )
-    recommendations = recommend_actions(issues)
-
-    dataset.quality_summary = {"summary": quality_summary, "issues": issues, "recommendations": recommendations}
-    dataset.anomaly_summary = anomaly_summary
-    dataset.last_run_at = datetime.utcnow()
-
-    issue_rows = sum(int(issue.get("count", 0) or 0) for issue in issues)
-    total_rows = int(quality_summary.get("total_rows", 0) or 0)
-    anomaly_count = int(anomaly_summary.get("anomaly_count", 0) or 0)
-    weighted = 0.0
-    for issue in issues:
-        count = float(issue.get("count", 0) or 0)
-        severity = issue.get("severity", "medium")
-        weight = 1.0 if severity == "high" else 0.6 if severity == "medium" else 0.3
-        weighted += count * weight
-    if total_rows:
-        risk_score = min(100.0, (weighted / total_rows) * 100 + (anomaly_count / total_rows) * 50)
-        quality_score = max(0.0, 100.0 - (issue_rows / total_rows) * 100)
-    else:
-        risk_score = 0.0
-        quality_score = 0.0
-
-    db.query(Case).filter(Case.dataset_id == dataset.id).delete(synchronize_session=False)
-    created_cases = 0
-    active_users = None
-    if dataset.assignment_mode == "round_robin":
-        active_users = [
-            row.email
-            for row in db.query(User)
-            .filter(User.is_active == True)  # noqa: E712
-            .order_by(User.created_at.asc(), User.id.asc())
-            .all()
-            if row.email
-        ]
-
-    for issue in issues:
-        if issue.get("severity") == "high":
-            due_date, sla_hours = _case_due_date(issue.get("severity", "high"), dataset.domain)
-            assignee = pick_assignee(db, dataset, active_users)
-            case = Case(
-                dataset_id=dataset.id,
-                title=issue.get("code", "issue"),
-                severity=issue.get("severity", "medium"),
-                status="open",
-                assignee=assignee,
-                summary=f"{issue.get('count', 0)} registros afectados",
-                recommendation=next((r["action"] for r in recommendations if r["code"] == issue.get("code")), None),
-                due_date=due_date,
-                sla_hours=sla_hours,
+    dataset = get_scoped_dataset(db, principal, dataset_id)
+    if not dataset_has_payload(db, dataset):
+        # A dataset that was never given a file is a 404. One whose file_path
+        # is set but whose bytes are gone is a different situation: fall
+        # through so the run raises DatasetPayloadMissing and the caller is
+        # told the instance lost the file rather than that it never existed.
+        lost_on_disk = bool(dataset.file_path) and not dataset.demo_session_id
+        if not lost_on_disk:
+            raise HTTPException(
+                status_code=404, detail="Dataset not found or no file uploaded"
             )
-            db.add(case)
-            created_cases += 1
 
-    duration_ms = int((time.perf_counter() - started_at) * 1000)
-    run = DatasetRun(
-        dataset_id=dataset.id,
-        run_at=dataset.last_run_at,
-        duration_ms=duration_ms,
-        total_rows=total_rows,
-        issue_count=int(quality_summary.get("issue_count", 0) or 0),
-        issue_rows=issue_rows,
-        anomaly_count=anomaly_count,
-        risk_score=round(risk_score, 1),
-        quality_score=round(quality_score, 1),
-    )
-    db.add(run)
-    db.commit()
+    if principal.is_demo:
+        try:
+            demo_service.assert_can_run(principal.demo)
+        except demo_service.DemoQuotaExceeded as exc:
+            raise demo_quota_error(exc) from None
+
+    try:
+        outcome = execute_quality_run(db, dataset)
+    except DatasetPayloadMissing as exc:
+        # The dataset exists; its bytes are gone. 409 rather than 404 so the
+        # client can tell "you asked for something that never existed" apart
+        # from "this instance lost the file".
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Dataset file not found") from None
+
+    if principal.is_demo:
+        demo_service.register_run(db, principal.demo)
+
     return DatasetRunResponse(
-        dataset_id=dataset.id,
-        quality_summary=dataset.quality_summary,
-        anomaly_summary=dataset.anomaly_summary,
-        cases_created=created_cases,
+        dataset_id=outcome.dataset_id,
+        quality_summary=outcome.quality_summary,
+        anomaly_summary=outcome.anomaly_summary,
+        cases_created=outcome.cases_created,
+        schema_status=outcome.schema_status,
+        quality_score=outcome.quality_score,
+        risk_score=outcome.risk_score,
     )
 
 
@@ -373,40 +415,53 @@ def _preview_stats(rows: list[dict], columns: list[str]) -> dict:
 def preview_dataset(
     dataset_id: int,
     db: Session = Depends(get_db),
-    user=Depends(get_current_user),
+    principal: Principal = Depends(get_principal),
 ):
-    dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
-    if not dataset or not dataset.file_path:
-        raise HTTPException(status_code=404, detail="Dataset not found or no file uploaded")
-    path = Path(dataset.file_path)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Dataset file not found")
+    dataset = get_scoped_dataset(db, principal, dataset_id)
 
     rows: list[dict] = []
     stats_rows: list[dict] = []
     sampled = False
+    columns: list[str] = []
     try:
-        with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
-            reader = csv.DictReader(handle)
-            columns = reader.fieldnames or []
-            for idx, row in enumerate(reader):
-                if idx < _PREVIEW_LIMIT:
-                    rows.append(row)
-                if idx < _STATS_LIMIT:
-                    stats_rows.append(row)
-                else:
-                    sampled = True
-                    break
+        handle = open_dataset_text(db, dataset)
+    except DatasetPayloadMissing as exc:
+        # The dataset exists; its bytes are gone. 409 rather than 404 so the
+        # client can tell "you asked for something that never existed" apart
+        # from "this instance lost the file".
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Dataset file not found") from None
+
+    try:
+        reader = csv.DictReader(handle)
+        columns = reader.fieldnames or []
+        for idx, row in enumerate(reader):
+            if idx < _PREVIEW_LIMIT:
+                rows.append(row)
+            if idx < _STATS_LIMIT:
+                stats_rows.append(row)
+            else:
+                sampled = True
+                break
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"No se pudo leer el CSV: {exc}") from exc
+    finally:
+        close = getattr(handle, "close", None)
+        if callable(close):
+            close()
 
     stats = _preview_stats(stats_rows, columns)
+    # Same sample, no extra I/O: the visitor learns whether the file matches
+    # the domain before spending a quality run on it.
+    schema_report = check_schema(columns, stats_rows, domain=dataset.domain)
     return {
         "columns": columns,
         "rows": rows,
         "stats": stats,
         "sampled": sampled,
         "sample_size": len(stats_rows),
+        "schema": schema_report.as_dict(),
     }
 
 
@@ -415,14 +470,12 @@ def list_runs(
     dataset_id: int,
     limit: int = 20,
     db: Session = Depends(get_db),
-    user=Depends(get_current_user),
+    principal: Principal = Depends(get_principal),
 ):
-    dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
-    if not dataset:
-        raise HTTPException(status_code=404, detail="Dataset not found")
+    dataset = get_scoped_dataset(db, principal, dataset_id)
     runs = (
         db.query(DatasetRun)
-        .filter(DatasetRun.dataset_id == dataset_id)
+        .filter(DatasetRun.dataset_id == dataset.id)
         .order_by(DatasetRun.run_at.desc())
         .limit(min(limit, 100))
         .all()
@@ -448,11 +501,15 @@ def export_report(
     dataset_id: int,
     format: str = "json",
     db: Session = Depends(get_db),
-    user=Depends(get_current_user),
+    principal: Principal = Depends(get_principal),
 ):
-    dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
-    if not dataset:
-        raise HTTPException(status_code=404, detail="Dataset not found")
+    dataset = get_scoped_dataset(db, principal, dataset_id)
+
+    if principal.is_demo:
+        try:
+            demo_service.assert_can_export(principal.demo)
+        except demo_service.DemoQuotaExceeded as exc:
+            raise demo_quota_error(exc) from None
 
     runs = (
         db.query(DatasetRun)
@@ -470,28 +527,23 @@ def export_report(
         field = anomaly.get("field", "unknown")
         anomaly_counts[field] = anomaly_counts.get(field, 0) + 1
 
-    issue_rows = sum(int(issue.get("count", 0) or 0) for issue in issues)
-    total_rows = int((dataset.quality_summary or {}).get("summary", {}).get("total_rows", 0) or 0)
-    anomaly_count = int((dataset.anomaly_summary or {}).get("anomaly_count", len(anomaly_list)) or 0)
+    summary_block = (dataset.quality_summary or {}).get("summary", {})
+    total_violations = rule_violations(issues)
+    total_rows = int(summary_block.get("total_rows", 0) or 0)
+    rows_affected = int(summary_block.get("rows_affected", 0) or 0)
+    critical_rows = int(summary_block.get("critical_rows", 0) or 0)
+    anomaly_count = int(
+        (dataset.anomaly_summary or {}).get("anomaly_count", len(anomaly_list)) or 0
+    )
     risk_score = latest_run.risk_score if latest_run and latest_run.risk_score is not None else None
-    quality_score = latest_run.quality_score if latest_run and latest_run.quality_score is not None else None
+    quality_score = (
+        latest_run.quality_score if latest_run and latest_run.quality_score is not None else None
+    )
 
     if risk_score is None:
-        weighted = 0.0
-        for issue in issues:
-            count = float(issue.get("count", 0) or 0)
-            severity = issue.get("severity", "medium")
-            weight = 1.0 if severity == "high" else 0.6 if severity == "medium" else 0.3
-            weighted += count * weight
-        if total_rows:
-            risk_score = round(
-                min(100.0, (weighted / total_rows) * 100 + (anomaly_count / total_rows) * 50),
-                1,
-            )
-            quality_score = round(max(0.0, 100.0 - (issue_rows / total_rows) * 100), 1)
-        else:
-            risk_score = 0.0
-            quality_score = 0.0
+        computed_risk, computed_quality = compute_scores(rows_affected, critical_rows, total_rows)
+        risk_score = round(computed_risk, 1)
+        quality_score = round(computed_quality, 1)
 
     active_rules = (dataset.quality_summary or {}).get("summary", {}).get("active_rules", [])
     disabled_rules = (dataset.rules_config or {}).get("disabled_rules", [])
@@ -510,7 +562,10 @@ def export_report(
         "rules_config": dataset.rules_config or {},
         "executive": {
             "total_rows": total_rows,
-            "issue_rows": issue_rows,
+            "rows_affected": rows_affected,
+            "critical_rows": critical_rows,
+            "findings": int(summary_block.get("issue_count", 0) or 0),
+            "rule_violations": total_violations,
             "anomaly_count": anomaly_count,
             "risk_score": risk_score,
             "quality_score": quality_score,
@@ -530,10 +585,17 @@ def export_report(
         "generated_at": datetime.utcnow().isoformat(),
     }
 
-    if format.lower() == "json":
+    fmt = format.lower()
+    if fmt not in {"json", "html", "csv"}:
+        raise HTTPException(status_code=400, detail="Unsupported format")
+
+    if principal.is_demo:
+        demo_service.register_export(db, principal.demo)
+
+    if fmt == "json":
         return JSONResponse(report)
 
-    if format.lower() == "html":
+    if fmt == "html":
         rows_html = "".join(
             f"<tr><td>{escape(str(issue.get('code', '')))}</td>"
             f"<td>{escape(str(issue.get('field', '') or '-'))}</td>"
@@ -579,19 +641,19 @@ def export_report(
     th, td {{ border-bottom: 1px solid #eee; padding: 8px 10px; font-size: 12px; text-align: left; }}
     th {{ background: #fafafa; text-transform: uppercase; letter-spacing: 0.08em; font-size: 10px; color: #666; }}
     .section {{ margin-bottom: 24px; }}
-    .pill {{ display: inline-block; padding: 4px 8px; border-radius: 999px; background: #ffefdf; color: #9a4d00; font-size: 11px; }}
   </style>
 </head>
 <body>
   <h1>Reporte de Dataset</h1>
-  <div class="meta">{escape(dataset.name)} · {escape(dataset.domain)} · {escape(dataset.source_type)} · Generado: {escape(report['generated_at'])}</div>
+  <div class="meta">{escape(dataset.name)} &middot; {escape(dataset.domain)} &middot; {escape(dataset.source_type)} &middot; Generado: {escape(report['generated_at'])}</div>
 
   <div class="grid">
     <div class="card"><strong>Filas analizadas</strong><div>{total_rows}</div></div>
-    <div class="card"><strong>Issues</strong><div>{issue_rows}</div></div>
-    <div class="card"><strong>Anomalías</strong><div>{anomaly_count}</div></div>
-    <div class="card"><strong>Riesgo</strong><div>{risk_score}</div></div>
-    <div class="card"><strong>Calidad</strong><div>{quality_score}</div></div>
+    <div class="card"><strong>Filas afectadas</strong><div>{rows_affected}</div></div>
+    <div class="card"><strong>Filas criticas</strong><div>{critical_rows}</div></div>
+    <div class="card"><strong>Hallazgos</strong><div>{summary_block.get("issue_count", 0)} ({total_violations} violaciones)</div></div>
+    <div class="card"><strong>Anomalias</strong><div>{anomaly_count}</div></div>
+    <div class="card"><strong>Calidad</strong><div>{quality_score}%</div></div>
   </div>
 
   <div class="section">
@@ -603,23 +665,23 @@ def export_report(
   <div class="section">
     <h2>Issues</h2>
     <table>
-      <thead><tr><th>Código</th><th>Campo</th><th>Casos</th><th>Severidad</th><th>Acción</th></tr></thead>
+      <thead><tr><th>Codigo</th><th>Campo</th><th>Casos</th><th>Severidad</th><th>Accion</th></tr></thead>
       <tbody>{rows_html or "<tr><td colspan='5'>Sin issues</td></tr>"}</tbody>
     </table>
   </div>
 
   <div class="section">
-    <h2>Anomalías</h2>
+    <h2>Anomalias</h2>
     <table>
       <thead><tr><th>Campo</th><th>Casos</th></tr></thead>
-      <tbody>{anomaly_html or "<tr><td colspan='2'>Sin anomalías</td></tr>"}</tbody>
+      <tbody>{anomaly_html or "<tr><td colspan='2'>Sin anomalias</td></tr>"}</tbody>
     </table>
   </div>
 
   <div class="section">
     <h2>Recomendaciones</h2>
     <table>
-      <thead><tr><th>Recomendación</th><th>Prioridad</th><th>Casos</th><th>Acción</th></tr></thead>
+      <thead><tr><th>Recomendacion</th><th>Prioridad</th><th>Casos</th><th>Accion</th></tr></thead>
       <tbody>{rec_html or "<tr><td colspan='4'>Sin recomendaciones</td></tr>"}</tbody>
     </table>
   </div>
@@ -627,7 +689,7 @@ def export_report(
   <div class="section">
     <h2>Historial de corridas</h2>
     <table>
-      <thead><tr><th>Fecha</th><th>Duración</th><th>Filas</th><th>Issues</th><th>Anomalías</th><th>Riesgo</th><th>Calidad</th></tr></thead>
+      <thead><tr><th>Fecha</th><th>Duracion</th><th>Filas</th><th>Issues</th><th>Anomalias</th><th>Riesgo</th><th>Calidad</th></tr></thead>
       <tbody>{runs_html or "<tr><td colspan='7'>Sin corridas</td></tr>"}</tbody>
     </table>
   </div>
@@ -636,15 +698,10 @@ def export_report(
 """
         return Response(content=html, media_type="text/html")
 
-    if format.lower() != "csv":
-        raise HTTPException(status_code=400, detail="Unsupported format")
-
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["type", "code", "field", "count", "severity", "action"])
-    rec_map = {
-        rec.get("code"): rec.get("action") for rec in recommendations
-    }
+    rec_map = {rec.get("code"): rec.get("action") for rec in recommendations}
     for issue in issues:
         writer.writerow(
             [
@@ -656,28 +713,12 @@ def export_report(
                 rec_map.get(issue.get("code"), ""),
             ]
         )
-    anomalies = (dataset.anomaly_summary or {}).get("anomalies", [])
-    anomaly_counts: dict[str, int] = {}
-    for anomaly in anomalies:
-        field = anomaly.get("field", "unknown")
-        anomaly_counts[field] = anomaly_counts.get(field, 0) + 1
     for field, count in anomaly_counts.items():
-        writer.writerow(
-            [
-                "anomaly",
-                field,
-                field,
-                count,
-                "",
-                "Revisar outliers y validar rangos.",
-            ]
-        )
+        writer.writerow(["anomaly", field, field, count, "", "Revisar outliers y validar rangos."])
 
     csv_bytes = output.getvalue().encode("utf-8")
     return Response(
         content=csv_bytes,
         media_type="text/csv",
-        headers={
-            "Content-Disposition": f"attachment; filename=dataset_{dataset_id}_report.csv"
-        },
+        headers={"Content-Disposition": f"attachment; filename=dataset_{dataset_id}_report.csv"},
     )

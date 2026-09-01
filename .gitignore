@@ -1,13 +1,13 @@
 # Secrets
-.env
-backend/.env
-frontend/.env.local
+# Every .env and every .env.<anything>, in any directory. The enumeration this
+# replaces listed .env.local and .env.production.local but not .env.production
+# or .env.staging, so those would have been committed. The pattern only matches
+# names beginning with ".env", so it cannot swallow source files.
 **/.env
-**/.env.local
-**/.env.development.local
-**/.env.test.local
-**/.env.production.local
+**/.env.*
+# ...except the templates, which carry names and comments but no values.
 !**/.env.example
+!**/.env.*.example
 
 # Dependencies
 **/node_modules/
@@ -38,6 +38,15 @@ logs/
 
 # Generated uploads / local data
 data/uploads/
+
+# Local databases and dumps. None exist today, but a stray dev.db or a
+# pg_dump in the working tree would otherwise be committed with real rows in
+# it. Thumbs.db is matched above by name, not by this pattern.
+*.db
+*.sqlite
+*.sqlite3
+*.sql
+*.dump
 
 # OS / editor noise
 .DS_Store

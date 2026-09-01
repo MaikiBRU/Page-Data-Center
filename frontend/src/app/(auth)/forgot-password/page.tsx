@@ -36,7 +36,7 @@ export default function ForgotPasswordPage() {
     <div className="mx-auto grid w-full max-w-4xl gap-10 lg:grid-cols-[1fr_1fr]">
       <div className="panel flex flex-col gap-6">
         <div>
-          <p className="text-xs uppercase tracking-[0.3em] text-white/40">
+          <p className="text-xs uppercase tracking-[0.3em] text-white/55">
             Recuperación
           </p>
           <h1 className="mt-3 text-3xl font-semibold">Restablecer contraseña</h1>
@@ -45,7 +45,7 @@ export default function ForgotPasswordPage() {
           </p>
         </div>
         <div className="grid gap-4 rounded-2xl border border-white/10 bg-white/5 p-5 text-sm text-white/70">
-          <p className="text-xs uppercase tracking-[0.3em] text-white/40">Recomendación</p>
+          <p className="text-xs uppercase tracking-[0.3em] text-white/55">Recomendación</p>
           <p>
             Usá una contraseña de al menos 8 caracteres con letras y números.
           </p>

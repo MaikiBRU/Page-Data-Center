@@ -1,11 +1,18 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { apiFetch, API_URL } from "@/lib/api";
 import { getToken } from "@/lib/auth";
+import { entryPath } from "@/lib/demo";
 import { emitToast } from "@/lib/toast";
+import { can } from "@/lib/permissions";
+import { severityLabel, severityTone } from "@/lib/vocabulary";
+import { formatNumber } from "@/lib/format";
 import { EmptyState } from "@/components/EmptyState";
+import { SchemaStatus, type SchemaReport } from "@/components/SchemaStatus";
+import { useEscapeKey } from "@/lib/useEscapeKey";
 
 interface QualityIssue {
   code: string;
@@ -34,7 +41,10 @@ interface DatasetQualitySummary {
   summary?: {
     total_rows?: number;
     domain_profile?: string;
+    schema_status?: string;
   };
+  /** Present once a run has happened; absent on datasets never analysed. */
+  schema?: SchemaReport | null;
   issues?: QualityIssue[];
   recommendations?: DatasetRecommendation[];
 }
@@ -75,6 +85,7 @@ interface PreviewData {
   >;
   sampled: boolean;
   sample_size: number;
+  schema?: SchemaReport | null;
 }
 
 interface DatasetRun {
@@ -114,16 +125,20 @@ export default function DatasetDetailPage() {
   const [runs, setRuns] = useState<DatasetRun[]>([]);
   const [runsLoading, setRunsLoading] = useState(false);
   const [showRuns, setShowRuns] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const loadDataset = useCallback(() => {
     apiFetch<DatasetDetail>(`/datasets/${datasetId}`)
-      .then(setDataset)
-      .catch(() => null);
+      .then((data) => {
+        setDataset(data);
+        setLoadError(null);
+      })
+      .catch((err: Error) => setLoadError(err.message));
   }, [datasetId]);
 
   useEffect(() => {
     if (!getToken()) {
-      router.push("/login");
+      router.push(entryPath());
       return;
     }
     loadDataset();
@@ -132,13 +147,19 @@ export default function DatasetDetailPage() {
       .catch(() => setMe(null));
   }, [datasetId, router, loadDataset]);
 
+  // /users/assignable is analyst-and-up: firing it for a demo visitor only
+  // produced a 403 in their console. It waits until the role is known.
   useEffect(() => {
+    if (!can(me, "users:assignable")) {
+      setAssignableUsers([]);
+      return;
+    }
     apiFetch<{ id: number; email: string; role: string; is_admin: boolean }[]>(
       "/users/assignable"
     )
       .then(setAssignableUsers)
       .catch(() => setAssignableUsers([]));
-  }, []);
+  }, [me]);
 
   const datasetAssignmentMode = dataset?.assignment_mode ?? "manual";
   const datasetAssignmentOwner = dataset?.assignment_owner ?? "";
@@ -157,13 +178,9 @@ export default function DatasetDetailPage() {
       setPreview(data);
     } catch (err) {
       const message = (err as Error).message || "Error al cargar vista previa";
-      if (message.toLowerCase().includes("failed to fetch")) {
-        setPreviewError(
-          `No se pudo conectar al backend (${API_URL}). Verificá que Uvicorn esté corriendo.`
-        );
-      } else {
-        setPreviewError(message);
-      }
+      // apiFetch already turns a network failure into a readable message; it
+      // used to print the API URL and tell the visitor to check Uvicorn.
+      setPreviewError(message);
     } finally {
       setPreviewLoading(false);
     }
@@ -213,7 +230,7 @@ export default function DatasetDetailPage() {
   }, [dataset, rulesProfiles]);
 
   const uploadFile = async (file: File) => {
-    if (!(me?.is_admin || me?.role === "analyst")) {
+    if (!canUpload) {
       emitToast({ message: "No tenés permisos para subir archivos.", kind: "error" });
       return;
     }
@@ -245,7 +262,7 @@ export default function DatasetDetailPage() {
   };
 
   const generateData = async () => {
-    if (!(me?.is_admin || me?.role === "analyst")) {
+    if (!canGenerate) {
       emitToast({ message: "No tenés permisos para generar datos.", kind: "error" });
       return;
     }
@@ -267,7 +284,7 @@ export default function DatasetDetailPage() {
   };
 
   const runQuality = async () => {
-    if (!(me?.is_admin || me?.role === "analyst")) {
+    if (!canRun) {
       emitToast({ message: "No tenés permisos para ejecutar calidad.", kind: "error" });
       return;
     }
@@ -284,16 +301,55 @@ export default function DatasetDetailPage() {
     }
   };
 
+  // Every overlay in the app was mouse-only; Escape now closes them.
+  useEscapeKey(Boolean(showRules), () => setShowRules(false));
+  useEscapeKey(Boolean(showRuns), () => setShowRuns(false));
+
+  if (loadError) {
+    return (
+      <div className="panel">
+        <p className="text-xs uppercase tracking-[0.3em] text-white/55">Dataset</p>
+        <h2 className="mt-2 text-2xl font-semibold">No se pudo abrir el dataset</h2>
+        <p className="mt-2 max-w-xl text-sm text-white/70">{loadError}</p>
+        <div className="mt-5 flex flex-wrap gap-3">
+          <button className="btn-secondary" onClick={loadDataset}>
+            Reintentar
+          </button>
+          <Link className="btn-primary" href="/datasets">
+            Volver a datasets
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
   if (!dataset) {
-    return <p className="text-sm text-[var(--muted)]">Cargando...</p>;
+    return (
+      <div className="flex flex-col gap-6">
+        <div className="skeleton h-10 w-64" />
+        <div className="skeleton h-40" />
+        <div className="grid gap-4 lg:grid-cols-2">
+          <div className="skeleton h-56" />
+          <div className="skeleton h-56" />
+        </div>
+      </div>
+    );
   }
 
   const issues = dataset.quality_summary?.issues ?? [];
   const recommendations = dataset.quality_summary?.recommendations ?? [];
   const anomalies = dataset.anomaly_summary?.anomalies ?? [];
   const profile = dataset.quality_summary?.summary?.domain_profile ?? dataset.domain;
-  const canEdit = me?.is_admin || me?.role === "analyst";
-  const canAdmin = me?.is_admin;
+  // The last run's verdict is authoritative; before a run the preview carries
+  // one computed from the same sample it already read.
+  const schemaReport = dataset.quality_summary?.schema ?? preview?.schema ?? null;
+  // The demo role may upload, generate and run quality, but not touch
+  // domain, rules or assignment. That split lives in lib/permissions.
+  const canUpload = can(me, "dataset:upload");
+  const canGenerate = can(me, "dataset:generate");
+  const canRun = can(me, "dataset:run_quality");
+  const canEdit = canUpload || canGenerate || canRun;
+  const canAdmin = can(me, "dataset:edit_rules");
   const formatDate = (value?: string | null) => {
     if (!value) return "Pendiente";
     const date = new Date(value);
@@ -550,23 +606,18 @@ export default function DatasetDetailPage() {
   return (
     <div className="flex flex-col gap-8">
       <div>
-        <p className="text-xs uppercase tracking-[0.3em] text-white/40">Dataset</p>
+        <p className="text-xs uppercase tracking-[0.3em] text-white/55">Dataset</p>
         <h2 className="mt-2 text-3xl font-semibold">{dataset.name}</h2>
         <p className="mt-2 text-sm text-[var(--muted)]">{dataset.domain}</p>
       </div>
 
-      <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-        <div className="panel">
-          <p className="text-xs uppercase tracking-[0.3em] text-white/40">Estado</p>
-          <p className="mt-3 text-sm text-white/70">
-            Fuente: {dataset.source_type}
-          </p>
-          <p className="mt-2 text-xs text-white/50">
-            Archivo: {dataset.file_path ?? "Sin archivo"}
-          </p>
-        </div>
-        <div className="panel">
-          <p className="text-xs uppercase tracking-[0.3em] text-white/40">Acciones</p>
+      <section className="panel">
+        <p className="text-xs uppercase tracking-[0.3em] text-white/55">Acciones</p>
+        <h3 className="mt-2 text-xl font-semibold">Analizar este dataset</h3>
+        <p className="mt-2 max-w-2xl text-sm text-white/70">
+          Subi tu propio CSV o genera un set de ejemplo, y despues ejecuta el motor
+          de calidad para obtener hallazgos, anomalias y recomendaciones.
+        </p>
           <div className="mt-4 flex flex-wrap gap-3">
             <label className="btn-secondary cursor-pointer">
               Subir CSV
@@ -608,9 +659,20 @@ export default function DatasetDetailPage() {
               Solo administradores o analistas pueden ejecutar acciones.
             </p>
           )}
+      </section>
+
+      <section className="grid gap-4 lg:grid-cols-2">
+        <div className="panel min-w-0">
+          <p className="text-xs uppercase tracking-[0.3em] text-white/55">Estado</p>
+          <p className="mt-3 text-sm text-white/70">
+            Fuente: {dataset.source_type}
+          </p>
+          <p className="mt-2 text-xs text-white/70">
+            {dataset.file_path ? "CSV cargado" : "Sin archivo cargado todavia"}
+          </p>
         </div>
-        <div className="panel">
-          <p className="text-xs uppercase tracking-[0.3em] text-white/40">Resumen</p>
+        <div className="panel min-w-0">
+          <p className="text-xs uppercase tracking-[0.3em] text-white/55">Resumen</p>
           <p className="mt-3 text-2xl font-semibold">
             {dataset.quality_summary?.summary?.total_rows ?? 0}
           </p>
@@ -632,7 +694,7 @@ export default function DatasetDetailPage() {
             >
               Configurar reglas
             </button>
-            <label className="mt-3 block text-[10px] uppercase tracking-[0.3em] text-white/40">
+            <label className="mt-3 block text-[10px] uppercase tracking-[0.3em] text-white/55">
               Cambiar dominio
               <select
                 className="input-base mt-2"
@@ -655,73 +717,23 @@ export default function DatasetDetailPage() {
             )}
           </div>
         </div>
-        <div className="panel">
-          <p className="text-xs uppercase tracking-[0.3em] text-white/40">Asignación</p>
-          <p className="mt-3 text-sm text-white/70">
-            Automatiza el owner de casos creados en corridas y recomendaciones.
-          </p>
-          <div className="mt-3 grid gap-3 text-sm">
-            <label className="text-xs uppercase tracking-[0.3em] text-white/40">
-              Modo
-              <select
-                className="input-base mt-2"
-                value={assignmentMode}
-                onChange={(event) => setAssignmentMode(event.target.value)}
-                disabled={!canAdmin}
-              >
-                <option value="manual">Manual (sin asignar)</option>
-                <option value="owner">Owner fijo</option>
-                <option value="round_robin">Round robin</option>
-              </select>
-            </label>
-            {assignmentMode === "owner" && (
-              <label className="text-xs uppercase tracking-[0.3em] text-white/40">
-                Owner
-                <select
-                  className="input-base mt-2"
-                  value={assignmentOwner}
-                  onChange={(event) => setAssignmentOwner(event.target.value)}
-                  disabled={!canAdmin}
-                >
-                  <option value="">Seleccionar usuario</option>
-                  {assignableUsers.map((user) => (
-                    <option key={user.id} value={user.email}>
-                      {user.email}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            )}
-            {assignmentMode === "round_robin" && (
-              <div className="card-box text-xs text-white/70">
-                <p className="text-white/50">Próximo en la ronda</p>
-                <p className="mt-1 font-semibold">{nextRoundRobin() ?? "Sin usuarios activos"}</p>
-                <p className="mt-1 text-[var(--muted)]">
-                  Usuarios activos: {assignableUsers.length}
-                </p>
-              </div>
-            )}
-            <button
-              className="btn-secondary"
-              onClick={saveAssignment}
-              disabled={!canAdmin || savingAssignment}
-            >
-              {savingAssignment ? "Guardando..." : "Guardar asignación"}
-            </button>
-            {!canAdmin && (
-              <p className="text-xs text-[var(--muted)]">
-                Solo administradores pueden editar asignación.
-              </p>
-            )}
-          </div>
-        </div>
       </section>
 
+      {schemaReport && (
+        <section className="panel">
+          <p className="text-xs uppercase tracking-[0.3em] text-white/55">Esquema</p>
+          <h3 className="mb-3 mt-2 text-xl font-semibold">Compatibilidad con el dominio</h3>
+          <SchemaStatus report={schemaReport} />
+        </section>
+      )}
+
+      {/* min-w-0: without it the wide preview table stretches this grid
+          item past its track and the whole page scrolls sideways. */}
       <section className="grid gap-4 lg:grid-cols-2">
-        <div className="panel">
+        <div className="panel min-w-0">
           <div className="flex items-center justify-between">
             <div>
-              <p className="text-xs uppercase tracking-[0.3em] text-white/40">Vista previa</p>
+              <p className="text-xs uppercase tracking-[0.3em] text-white/55">Vista previa</p>
               <h3 className="mt-2 text-xl font-semibold">Primeras filas</h3>
             </div>
             <button className="btn-mini" onClick={loadPreview} disabled={previewLoading}>
@@ -796,10 +808,10 @@ export default function DatasetDetailPage() {
           )}
         </div>
 
-        <div className="panel">
+        <div className="panel min-w-0">
           <div className="flex items-center justify-between">
             <div>
-              <p className="text-xs uppercase tracking-[0.3em] text-white/40">Historial</p>
+              <p className="text-xs uppercase tracking-[0.3em] text-white/55">Historial</p>
               <h3 className="mt-2 text-xl font-semibold">Corridas recientes</h3>
             </div>
             <button className="btn-mini" onClick={() => setShowRuns(true)} disabled={runs.length === 0}>
@@ -832,11 +844,11 @@ export default function DatasetDetailPage() {
                     <span className="text-xs text-white/50">{formatDuration(run.duration_ms)}</span>
                   </div>
                   <p className="mt-2 text-xs text-[var(--muted)]">
-                    Filas: {run.total_rows ?? 0} · Issues: {run.issue_rows ?? 0} ·
+                    Filas: {run.total_rows ?? 0} · Violaciones: {run.issue_rows ?? 0} ·
                     Anomalías: {run.anomaly_count ?? 0}
                   </p>
                   <p className="mt-1 text-xs text-[var(--muted)]">
-                    Riesgo: {run.risk_score ?? 0} · Calidad: {run.quality_score ?? 0}
+                    Filas críticas: {run.risk_score ?? 0}% · Calidad: {run.quality_score ?? 0}%
                   </p>
                 </div>
               ))}
@@ -848,7 +860,7 @@ export default function DatasetDetailPage() {
       {preview && (
         <section className="panel">
           <div>
-            <p className="text-xs uppercase tracking-[0.3em] text-white/40">Perfil</p>
+            <p className="text-xs uppercase tracking-[0.3em] text-white/55">Perfil</p>
             <h3 className="mt-2 text-xl font-semibold">Perfil de columnas</h3>
             <p className="mt-2 text-sm text-[var(--muted)]">
               Resumen rápido por columna para detectar vacíos y rangos.
@@ -887,23 +899,45 @@ export default function DatasetDetailPage() {
       )}
 
       <section className="panel">
-        <h3 className="text-xl font-semibold">Issues detectados</h3>
+        {/* Called "issues" here, "hallazgos" on the dashboard and "violaciones"
+            in Corridas: one concept, three names. It follows the dashboard.
+            The rule code was printed raw (`invalid_delivery_window`) and the
+            field was dropped, so `missing_value` on address and on warehouse
+            rendered as two identical rows. */}
+        <p className="text-xs uppercase tracking-[0.3em] text-white/55">Resultados</p>
+        <h3 className="mt-2 text-xl font-semibold">Hallazgos</h3>
+        <p className="mt-2 text-sm text-white/70">
+          Cada hallazgo es una combinación de regla y campo. El número indica
+          cuántas filas la incumplen.
+        </p>
         <div className="mt-4 grid gap-3">
           {issues.length === 0 ? (
             <EmptyState
-              title="Sin issues por ahora."
-              description="Corré calidad para detectar nuevos issues."
+              title="Sin hallazgos por ahora."
+              description="Ejecutá calidad para analizar el dataset."
               actions={[{ label: "Ejecutar calidad", onClick: runQuality, variant: "secondary" }]}
               compact
             />
           ) : (
             issues.map((issue, index: number) => (
-              <div key={`${issue.code}-${index}`} className="card-box">
-                <div className="flex items-center justify-between">
-                  <p className="font-medium">{issue.code}</p>
-                  <span className="text-xs text-white/60">{issue.count} casos</span>
+              <div key={`${issue.code}-${issue.field ?? ""}-${index}`} className="card-box">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="font-medium">{rulesCatalog[issue.code] ?? issue.code}</p>
+                    {issue.field && (
+                      <p className="mt-1 text-xs text-white/60">Campo: {issue.field}</p>
+                    )}
+                  </div>
+                  <div className="flex shrink-0 items-center gap-2">
+                    <span className={`badge ${severityTone(issue.severity)}`}>
+                      {severityLabel(issue.severity)}
+                    </span>
+                    <span className="text-sm font-semibold tabular-nums">
+                      {formatNumber(issue.count ?? 0)}
+                      <span className="ml-1 text-xs font-normal text-white/60">filas</span>
+                    </span>
+                  </div>
                 </div>
-                <p className="text-xs text-[var(--muted)]">Severidad: {issue.severity}</p>
               </div>
             ))
           )}
@@ -946,7 +980,9 @@ export default function DatasetDetailPage() {
             ) : (
               recommendations.map((rec, index: number) => (
                 <div key={`${rec.code}-${index}`} className="card-box">
-                  <p className="font-medium">{rec.code}</p>
+                  <p className="font-medium">
+                    {rec.label ?? rulesCatalog[rec.code] ?? rec.code}
+                  </p>
                   <p className="text-xs text-[var(--muted)]">{rec.action}</p>
                 </div>
               ))
@@ -955,10 +991,71 @@ export default function DatasetDetailPage() {
         </div>
       </section>
 
+      <section className="panel">
+          <p className="text-xs uppercase tracking-[0.3em] text-white/55">Asignación</p>
+          <p className="mt-3 text-sm text-white/70">
+            Define quién queda a cargo de los casos que generan las corridas y las recomendaciones.
+          </p>
+          <div className="mt-3 grid gap-3 text-sm">
+            <label className="text-xs uppercase tracking-[0.3em] text-white/55">
+              Modo
+              <select
+                className="input-base mt-2"
+                value={assignmentMode}
+                onChange={(event) => setAssignmentMode(event.target.value)}
+                disabled={!canAdmin}
+              >
+                <option value="manual">Manual (sin asignar)</option>
+                <option value="owner">Responsable fijo</option>
+                <option value="round_robin">Round robin</option>
+              </select>
+            </label>
+            {assignmentMode === "owner" && (
+              <label className="text-xs uppercase tracking-[0.3em] text-white/55">
+                Responsable
+                <select
+                  className="input-base mt-2"
+                  value={assignmentOwner}
+                  onChange={(event) => setAssignmentOwner(event.target.value)}
+                  disabled={!canAdmin}
+                >
+                  <option value="">Seleccionar usuario</option>
+                  {assignableUsers.map((user) => (
+                    <option key={user.id} value={user.email}>
+                      {user.email}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
+            {assignmentMode === "round_robin" && (
+              <div className="card-box text-xs text-white/70">
+                <p className="text-white/50">Próximo en la ronda</p>
+                <p className="mt-1 font-semibold">{nextRoundRobin() ?? "Sin usuarios activos"}</p>
+                <p className="mt-1 text-[var(--muted)]">
+                  Usuarios activos: {assignableUsers.length}
+                </p>
+              </div>
+            )}
+            <button
+              className="btn-secondary"
+              onClick={saveAssignment}
+              disabled={!canAdmin || savingAssignment}
+            >
+              {savingAssignment ? "Guardando..." : "Guardar asignación"}
+            </button>
+            {!canAdmin && (
+              <p className="text-xs text-[var(--muted)]">
+                Solo administradores pueden editar asignación.
+              </p>
+            )}
+          </div>
+      </section>
+
       {showRules && (
         <div className="modal-backdrop" onClick={() => setShowRules(false)}>
           <div
-            className="modal-panel relative max-h-[85vh] max-w-lg overflow-hidden"
+            role="dialog" aria-modal="true" className="modal-panel relative max-h-[85vh] max-w-lg overflow-hidden"
             onClick={(event) => event.stopPropagation()}
           >
             <button
@@ -969,7 +1066,7 @@ export default function DatasetDetailPage() {
             </button>
             <div className="scroll-soft flex max-h-[75vh] flex-col gap-4 overflow-auto pr-2">
               <div>
-                <p className="text-xs uppercase tracking-[0.3em] text-white/40">Reglas activas</p>
+                <p className="text-xs uppercase tracking-[0.3em] text-white/55">Reglas activas</p>
                 <h3 className="mt-2 text-xl font-semibold">
                   Perfil {profileLabel()}
                 </h3>
@@ -1074,10 +1171,10 @@ export default function DatasetDetailPage() {
 
       {showRuns && (
         <div className="modal-backdrop">
-          <div className="modal-panel max-w-4xl space-y-4">
+          <div role="dialog" aria-modal="true" className="modal-panel max-w-4xl space-y-4">
             <div className="flex items-center justify-between">
               <div>
-                <p className="text-xs uppercase tracking-[0.3em] text-white/40">Historial</p>
+                <p className="text-xs uppercase tracking-[0.3em] text-white/55">Historial</p>
                 <h3 className="mt-2 text-xl font-semibold">Todas las corridas</h3>
               </div>
               <button className="btn-secondary" onClick={() => setShowRuns(false)}>
@@ -1091,9 +1188,9 @@ export default function DatasetDetailPage() {
                     <th>Fecha</th>
                     <th>Duración</th>
                     <th>Filas</th>
-                    <th>Issues</th>
+                    <th>Violaciones</th>
                     <th>Anomalías</th>
-                    <th>Riesgo</th>
+                    <th>% críticas</th>
                     <th>Calidad</th>
                   </tr>
                 </thead>

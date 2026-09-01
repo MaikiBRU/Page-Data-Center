@@ -10,12 +10,21 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, get_db, require_permission
+from app.api.deps import (
+    Principal,
+    demo_quota_error,
+    get_db,
+    get_principal,
+    require_permission,
+    scope_cases,
+    scope_datasets,
+)
+from app.services import demo_session as demo_service
 from app.models.case import Case
 from app.models.dataset import Dataset
 from app.models.dataset_run import DatasetRun
 from app.services.data_generator import generate_dataset
-from app.services.data_quality import load_records, recommend_actions, run_anomaly_detection, run_quality_checks
+from app.services.quality_run import execute_quality_run
 
 BASE_DIR = Path(__file__).resolve().parents[4]
 UPLOAD_DIR = BASE_DIR / "data" / "uploads"
@@ -26,216 +35,186 @@ _DEMO_ROWS = 420
 _DEMO_ANOMALY_RATE = 0.12
 
 
-def _issue_rows(issues: list[dict]) -> int:
-    return sum(int(issue.get("count", 0) or 0) for issue in issues)
+def _dataset_facts(dataset: Dataset) -> dict:
+    """Row-level facts for one dataset, read from its last stored run.
 
-
-def _weighted_issues(issues: list[dict]) -> float:
-    weights = {"high": 1.0, "medium": 0.6, "low": 0.3}
-    total = 0.0
-    for issue in issues:
-        count = float(issue.get("count", 0) or 0)
-        severity = issue.get("severity", "medium")
-        total += count * weights.get(severity, 0.6)
-    return total
-
-
-def _base_value(domain: str | None) -> float:
-    mapping = {
-        "ecommerce": 120.0,
-        "logistica": 90.0,
-        "ecommerce-logistica": 110.0,
-    }
-    return mapping.get(domain or "", 100.0)
-
-
-def _impact_and_risk(dataset: Dataset) -> dict:
+    Everything here is a count of rows or of findings. There is no weighting,
+    no monetary conversion and no tuning constant, so every number can be
+    traced back to the CSV it came from.
+    """
     summary = dataset.quality_summary or {}
+    block = summary.get("summary") or {} if isinstance(summary, dict) else {}
     issues = summary.get("issues", []) if isinstance(summary, dict) else []
-    anomalies = (dataset.anomaly_summary or {}).get("anomalies", [])
-    total_rows = int((summary.get("summary") or {}).get("total_rows", 0) or 0)
-    weighted = _weighted_issues(issues)
-    issue_rows = _issue_rows(issues)
-    anomaly_count = len(anomalies)
-    base = _base_value(dataset.domain)
-    impact = weighted * base + anomaly_count * base * 0.4
-    if total_rows <= 0:
-        risk_score = 0.0
-    else:
-        risk_score = min(100.0, (weighted / total_rows) * 100 + (anomaly_count / total_rows) * 50)
+    total_rows = int(block.get("total_rows", 0) or 0)
+
+    # rows_affected / critical_rows were added to the summary when row level
+    # tracking landed. Runs stored before that have neither, and there is no
+    # way to recover them from the aggregated counts, so such a dataset is
+    # excluded from row based aggregates instead of being counted as clean.
+    has_row_metrics = "rows_affected" in block
+    rows_affected = min(int(block.get("rows_affected", 0) or 0), total_rows)
+    critical_rows = min(int(block.get("critical_rows", 0) or 0), total_rows)
+
     return {
-        "issue_rows": issue_rows,
-        "weighted_issues": weighted,
-        "anomaly_count": anomaly_count,
         "total_rows": total_rows,
-        "impact": impact,
-        "risk_score": risk_score,
+        "rows_affected": rows_affected,
+        "critical_rows": critical_rows,
+        "has_row_metrics": has_row_metrics and total_rows > 0,
+        # "compatible" | "warning" | "incompatible", or None when the dataset
+        # has never been analysed. Lets the UI say why a score is missing
+        # instead of showing the same blank for both cases.
+        "schema_status": (block.get("schema_status") if isinstance(block, dict) else None),
+        "findings": int(block.get("issue_count", len(issues)) or 0),
+        "rule_violations": int(
+            block.get(
+                "rule_violations",
+                sum(int(issue.get("count", 0) or 0) for issue in issues),
+            )
+            or 0
+        ),
+        # The stored anomaly list is capped at 50 for payload size; the count
+        # is not. Reading len(list) understated large datasets by up to 10x.
+        "anomalies": int((dataset.anomaly_summary or {}).get("anomaly_count", 0) or 0),
+        "analyzed": dataset.last_run_at is not None,
     }
 
 
-def _risk_level(score: float) -> str:
-    if score >= 70:
-        return "alto"
-    if score >= 40:
-        return "medio"
-    return "bajo"
+def _quality_score(rows_affected: int, total_rows: int) -> float:
+    """Share of rows that passed every active rule. See services/quality_run."""
+    if total_rows <= 0:
+        return 0.0
+    return round(100.0 * (1 - min(rows_affected, total_rows) / total_rows), 1)
 
 
-def _delta(current: float, previous: float) -> float:
-    if previous == 0:
-        return 100.0 if current > 0 else 0.0
-    return round(((current - previous) / previous) * 100, 1)
+def _pct(part: int, whole: int) -> float:
+    if whole <= 0:
+        return 0.0
+    return round(100.0 * part / whole, 1)
 
 
-def _window_metrics(datasets: list[Dataset], start: datetime.date, end: datetime.date) -> dict:
-    totals = {
-        "runs": 0,
-        "issue_rows": 0,
-        "weighted_issues": 0.0,
-        "anomalies": 0,
-        "total_rows": 0,
-        "impact": 0.0,
-    }
-    for dataset in datasets:
-        if not dataset.last_run_at:
-            continue
-        run_date = dataset.last_run_at.date()
-        if run_date < start or run_date > end:
-            continue
-        totals["runs"] += 1
-        metrics = _impact_and_risk(dataset)
-        totals["issue_rows"] += metrics["issue_rows"]
-        totals["weighted_issues"] += metrics["weighted_issues"]
-        totals["anomalies"] += metrics["anomaly_count"]
-        totals["total_rows"] += metrics["total_rows"]
-        totals["impact"] += metrics["impact"]
+def _quality_trend(db: Session, dataset_ids: list[int]) -> dict | None:
+    """Compare the latest run of each dataset against its own previous run.
 
-    if totals["total_rows"] > 0:
-        totals["risk_score"] = min(
-            100.0,
-            (totals["weighted_issues"] / totals["total_rows"]) * 100
-            + (totals["anomalies"] / totals["total_rows"]) * 50,
-        )
-    else:
-        totals["risk_score"] = 0.0
-    return totals
+    Returns None when no dataset has two comparable runs. The dashboard used
+    to derive a "previous week" from ``dataset.last_run_at``, a single
+    timestamp: a dataset can only fall inside one of the two windows, so the
+    previous window was always empty and every delta came out at +100%. The
+    real history lives in ``dataset_runs``, so the comparison is made there,
+    and it is reported in percentage points, which needs no division by a
+    possibly zero baseline.
+    """
+    if not dataset_ids:
+        return None
 
-
-def _record_run(dataset: Dataset, issues: list[dict]) -> None:
-    summary = dataset.quality_summary or {}
-    total_rows = int((summary.get("summary") or {}).get("total_rows", 0) or 0)
-    issue_count = int((summary.get("summary") or {}).get("issue_count", 0) or 0)
-    issue_rows = sum(int(issue.get("count", 0) or 0) for issue in issues)
-    anomaly_count = int((dataset.anomaly_summary or {}).get("anomaly_count", 0) or 0)
-    weighted = _weighted_issues(issues)
-    if total_rows:
-        risk_score = min(100.0, (weighted / total_rows) * 100 + (anomaly_count / total_rows) * 50)
-        quality_score = max(0.0, 100.0 - (issue_rows / total_rows) * 100)
-    else:
-        risk_score = 0.0
-        quality_score = 0.0
-    run = DatasetRun(
-        dataset_id=dataset.id,
-        run_at=dataset.last_run_at or datetime.utcnow(),
-        duration_ms=None,
-        total_rows=total_rows,
-        issue_count=issue_count,
-        issue_rows=issue_rows,
-        anomaly_count=anomaly_count,
-        risk_score=round(risk_score, 1),
-        quality_score=round(quality_score, 1),
+    runs = (
+        db.query(DatasetRun)
+        .filter(DatasetRun.dataset_id.in_(dataset_ids))
+        .filter(DatasetRun.rows_affected.is_not(None))
+        .filter(DatasetRun.total_rows.is_not(None))
+        .filter(DatasetRun.total_rows > 0)
+        .order_by(DatasetRun.dataset_id.asc(), DatasetRun.run_at.desc(), DatasetRun.id.desc())
+        .all()
     )
-    return run
+
+    by_dataset: dict[int, list[DatasetRun]] = {}
+    for run in runs:
+        by_dataset.setdefault(run.dataset_id, []).append(run)
+
+    latest_rows = latest_affected = previous_rows = previous_affected = 0
+    compared = 0
+    for dataset_runs in by_dataset.values():
+        if len(dataset_runs) < 2:
+            continue
+        latest, previous = dataset_runs[0], dataset_runs[1]
+        latest_rows += latest.total_rows
+        latest_affected += min(latest.rows_affected, latest.total_rows)
+        previous_rows += previous.total_rows
+        previous_affected += min(previous.rows_affected, previous.total_rows)
+        compared += 1
+
+    if compared == 0 or latest_rows == 0 or previous_rows == 0:
+        return None
+
+    current = _quality_score(latest_affected, latest_rows)
+    previous_score = _quality_score(previous_affected, previous_rows)
+    return {
+        "current": current,
+        "previous": previous_score,
+        # Percentage points, not a percent change: quality is already a
+        # percentage, so a ratio between two of them would not mean anything.
+        "delta_points": round(current - previous_score, 1),
+        "datasets_compared": compared,
+    }
+
 
 @router.get("/kpis")
-def dashboard_kpis(db: Session = Depends(get_db), user=Depends(get_current_user)):
-    datasets = db.query(Dataset).all()
-    open_cases = db.query(Case).filter(Case.status == "open").count()
-    total_issues = 0
-    impact_total = 0.0
-    weighted_total = 0.0
-    anomaly_total = 0
-    total_rows = 0
+def dashboard_kpis(
+    db: Session = Depends(get_db), principal: Principal = Depends(get_principal)
+):
+    """Headline data quality figures.
+
+    Every value is a count of rows, a count of findings, or a percentage
+    derived from those two. Nothing is estimated or converted into money.
+    """
+    datasets = scope_datasets(db.query(Dataset), principal).all()
+
+    # "Open" here means the same thing as in /cases/summary: anything not
+    # resolved. Counting only status == "open" left in_progress, blocked and
+    # escalated cases out and disagreed with the Casos page.
+    open_cases = (
+        scope_cases(db.query(Case), principal).filter(Case.status != "resolved").count()
+    )
+
+    total_rows = rows_affected = critical_rows = 0
+    findings = violations = anomalies = analyzed = 0
+    measurable_datasets = 0
     for dataset in datasets:
-        if dataset.quality_summary and dataset.quality_summary.get("summary"):
-            total_issues += dataset.quality_summary["summary"].get("issue_count", 0)
-        metrics = _impact_and_risk(dataset)
-        impact_total += metrics["impact"]
-        weighted_total += metrics["weighted_issues"]
-        anomaly_total += metrics["anomaly_count"]
-        total_rows += metrics["total_rows"]
+        facts = _dataset_facts(dataset)
+        if facts["analyzed"]:
+            analyzed += 1
+        findings += facts["findings"]
+        violations += facts["rule_violations"]
+        anomalies += facts["anomalies"]
+        if facts["has_row_metrics"]:
+            measurable_datasets += 1
+            total_rows += facts["total_rows"]
+            rows_affected += facts["rows_affected"]
+            critical_rows += facts["critical_rows"]
 
-    if total_rows > 0:
-        risk_score = min(
-            100.0, (weighted_total / total_rows) * 100 + (anomaly_total / total_rows) * 50
-        )
-    else:
-        risk_score = 0.0
-
-    today = datetime.utcnow().date()
-    current_start = today - timedelta(days=6)
-    prev_start = today - timedelta(days=13)
-    prev_end = today - timedelta(days=7)
-    current = _window_metrics(datasets, current_start, today)
-    previous = _window_metrics(datasets, prev_start, prev_end)
-
-    new_cases_current = (
-        db.query(Case)
-        .filter(Case.created_at >= datetime.combine(current_start, datetime.min.time()))
-        .filter(Case.created_at <= datetime.combine(today, datetime.max.time()))
-        .count()
-    )
-    new_cases_previous = (
-        db.query(Case)
-        .filter(Case.created_at >= datetime.combine(prev_start, datetime.min.time()))
-        .filter(Case.created_at <= datetime.combine(prev_end, datetime.max.time()))
-        .count()
-    )
-
+    dataset_ids = [dataset.id for dataset in datasets]
     return {
         "datasets": len(datasets),
+        "datasets_analyzed": analyzed,
+        # Number of datasets contributing to the row based figures below.
+        "datasets_measured": measurable_datasets,
+        "total_rows": total_rows,
+        "rows_affected": rows_affected,
+        "rows_affected_pct": _pct(rows_affected, total_rows),
+        "critical_rows": critical_rows,
+        "critical_rows_pct": _pct(critical_rows, total_rows),
+        "quality_score": _quality_score(rows_affected, total_rows),
+        "findings": findings,
+        "rule_violations": violations,
+        "anomalies": anomalies,
         "open_cases": open_cases,
-        "issues": total_issues,
-        "impact_estimated": round(impact_total, 2),
-        "risk_score": round(risk_score, 1),
-        "risk_level": _risk_level(risk_score),
-        "week": {
-            "runs": {
-                "current": current["runs"],
-                "previous": previous["runs"],
-                "delta_pct": _delta(current["runs"], previous["runs"]),
-            },
-            "issues": {
-                "current": current["issue_rows"],
-                "previous": previous["issue_rows"],
-                "delta_pct": _delta(current["issue_rows"], previous["issue_rows"]),
-            },
-            "anomalies": {
-                "current": current["anomalies"],
-                "previous": previous["anomalies"],
-                "delta_pct": _delta(current["anomalies"], previous["anomalies"]),
-            },
-            "impact": {
-                "current": round(current["impact"], 2),
-                "previous": round(previous["impact"], 2),
-                "delta_pct": _delta(current["impact"], previous["impact"]),
-            },
-            "risk_score": {
-                "current": round(current["risk_score"], 1),
-                "previous": round(previous["risk_score"], 1),
-                "delta_pct": _delta(current["risk_score"], previous["risk_score"]),
-            },
-            "cases": {
-                "current": new_cases_current,
-                "previous": new_cases_previous,
-                "delta_pct": _delta(new_cases_current, new_cases_previous),
-            },
-        },
+        # None when no dataset has been run twice, so the UI shows nothing
+        # rather than a fabricated delta.
+        "quality_trend": _quality_trend(db, dataset_ids),
     }
 
 
 def _demo_datasets(db: Session) -> list[Dataset]:
-    return db.query(Dataset).filter(Dataset.name.ilike("%demo%")).all()
+    """Legacy admin seeded datasets in the authenticated app.
+
+    Explicitly excludes sandbox rows so an administrator running "reset demo"
+    can never delete a visitor's in-flight session data.
+    """
+    return (
+        db.query(Dataset)
+        .filter(Dataset.demo_session_id.is_(None))
+        .filter(Dataset.name.ilike("%demo%"))
+        .all()
+    )
 
 
 def _cleanup_dataset_files(dataset: Dataset) -> None:
@@ -254,38 +233,27 @@ def _cleanup_dataset_files(dataset: Dataset) -> None:
             pass
 
 
-def _rebuild_dataset(dataset: Dataset) -> None:
+def _rebuild_dataset(db: Session, dataset: Dataset) -> None:
+    """Regenerate an admin demo dataset and re-analyse it.
+
+    Delegates to the shared pipeline so this path cannot drift from the one
+    used by POST /datasets/{id}/run-quality, as the previous copy had.
+    """
     dataset_dir = UPLOAD_DIR / f"dataset_{dataset.id}"
     dataset_dir.mkdir(parents=True, exist_ok=True)
     file_path = dataset_dir / "generated.csv"
     generate_dataset(str(file_path), _DEMO_ROWS, _DEMO_ANOMALY_RATE)
     dataset.file_path = str(file_path)
     dataset.source_type = "generated"
-
-    records = load_records(dataset.file_path)
-    rules_config = dataset.rules_config or {}
-    disabled_rules = rules_config.get("disabled_rules", [])
-    quality_summary, issues = run_quality_checks(
-        records, domain=dataset.domain, disabled_rules=disabled_rules
-    )
-    anomaly_summary = run_anomaly_detection(
-        records, domain=dataset.domain, disabled_rules=disabled_rules
-    )
-    recommendations = recommend_actions(issues)
-
-    dataset.quality_summary = {
-        "summary": quality_summary,
-        "issues": issues,
-        "recommendations": recommendations,
-    }
-    dataset.anomaly_summary = anomaly_summary
-    dataset.last_run_at = datetime.utcnow()
-
-    return issues
+    db.commit()
+    execute_quality_run(db, dataset)
 
 
 @router.post("/demo/reset")
-def reset_demo(db: Session = Depends(get_db), user=Depends(require_permission("dashboard:demo"))):
+def reset_demo(
+    db: Session = Depends(get_db),
+    principal: Principal = Depends(require_permission("dashboard:demo")),
+):
     demos = _demo_datasets(db)
     if not demos:
         return {"removed": 0}
@@ -303,42 +271,23 @@ def reset_demo(db: Session = Depends(get_db), user=Depends(require_permission("d
 @router.post("/demo/regenerate")
 def regenerate_demo(
     db: Session = Depends(get_db),
-    user=Depends(require_permission("dashboard:demo")),
+    principal: Principal = Depends(require_permission("dashboard:demo")),
 ):
     demos = _demo_datasets(db)
     if not demos:
         raise HTTPException(status_code=404, detail="No demo datasets found")
     regenerated = 0
     for dataset in demos:
-        issues = _rebuild_dataset(dataset)
-        db.query(Case).filter(Case.dataset_id == dataset.id).delete(synchronize_session=False)
-        for issue in issues:
-            if issue.get("severity") == "high":
-                case = Case(
-                    dataset_id=dataset.id,
-                    title=issue.get("code", "issue"),
-                    severity=issue.get("severity", "medium"),
-                    status="open",
-                    summary=f"{issue.get('count', 0)} registros afectados",
-                    recommendation=next(
-                        (
-                            r["action"]
-                            for r in (dataset.quality_summary or {}).get("recommendations", [])
-                            if r.get("code") == issue.get("code")
-                        ),
-                        None,
-                    ),
-                )
-                db.add(case)
-        db.add(_record_run(dataset, issues))
+        _rebuild_dataset(db, dataset)
         regenerated += 1
-    db.commit()
     return {"regenerated": regenerated}
 
 
 @router.get("/insights")
-def dashboard_insights(db: Session = Depends(get_db), user=Depends(get_current_user)):
-    datasets = db.query(Dataset).all()
+def dashboard_insights(
+    db: Session = Depends(get_db), principal: Principal = Depends(get_principal)
+):
+    datasets = scope_datasets(db.query(Dataset), principal).all()
 
     issues_by_code: dict[str, int] = defaultdict(int)
     issues_by_severity: dict[str, int] = defaultdict(int)
@@ -367,19 +316,25 @@ def dashboard_insights(db: Session = Depends(get_db), user=Depends(get_current_u
             field = anomaly.get("field", "unknown")
             anomalies_by_field[field] += 1
 
-        total_rows = (summary.get("summary") or {}).get("total_rows", 0)
-        issue_count = (summary.get("summary") or {}).get("issue_count", 0)
-        if total_rows:
-            ratio = min(1.0, issue_count / max(1, total_rows))
-            score = round(100 - ratio * 100, 1)
-        else:
-            score = 0
-
+        # Health is the same quality score used everywhere else. It used to
+        # be 100 - findings / total_rows, which divides a count of findings
+        # by a count of rows and therefore sat near 100 no matter how
+        # damaged the data was, disagreeing with dataset_runs.quality_score
+        # for the very same dataset.
+        facts = _dataset_facts(dataset)
         dataset_health.append(
             {
                 "id": dataset.id,
                 "name": dataset.name,
-                "score": score,
+                "score": (
+                    _quality_score(facts["rows_affected"], facts["total_rows"])
+                    if facts["has_row_metrics"]
+                    else None
+                ),
+                "total_rows": facts["total_rows"],
+                "rows_affected": facts["rows_affected"] if facts["has_row_metrics"] else None,
+                "critical_rows": facts["critical_rows"] if facts["has_row_metrics"] else None,
+                "schema_status": facts["schema_status"],
                 "last_run_at": dataset.last_run_at.isoformat() if dataset.last_run_at else None,
             }
         )
@@ -410,7 +365,15 @@ def dashboard_insights(db: Session = Depends(get_db), user=Depends(get_current_u
             {"label": field, "value": count} for field, count in anomalies_sorted
         ],
         "runs_last_7_days": run_series,
-        "dataset_health": sorted(dataset_health, key=lambda item: item["score"], reverse=True),
+        # Worst first: that is the order somebody acting on this needs.
+        # Datasets without row metrics have no score and go last.
+        "dataset_health": sorted(
+            dataset_health,
+            key=lambda item: (
+                item["score"] is None,
+                item["score"] if item["score"] is not None else 0,
+            ),
+        ),
     }
 
 
@@ -418,11 +381,17 @@ def dashboard_insights(db: Session = Depends(get_db), user=Depends(get_current_u
 def export_report(
     format: str = "json",
     db: Session = Depends(get_db),
-    user=Depends(get_current_user),
+    principal: Principal = Depends(get_principal),
 ):
-    kpis = dashboard_kpis(db, user)
-    insights = dashboard_insights(db, user)
-    datasets = db.query(Dataset).all()
+    if principal.is_demo:
+        try:
+            demo_service.assert_can_export(principal.demo)
+        except demo_service.DemoQuotaExceeded as exc:
+            raise demo_quota_error(exc) from None
+        demo_service.register_export(db, principal.demo)
+    kpis = dashboard_kpis(db, principal)
+    insights = dashboard_insights(db, principal)
+    datasets = scope_datasets(db.query(Dataset), principal).all()
     report = {
         "generated_at": datetime.utcnow().isoformat(),
         "kpis": kpis,
@@ -450,18 +419,26 @@ def export_report(
             for item in insights.get("anomalies_by_field_all", [])
         )
         health_html = "".join(
-            f"<tr><td>{escape(str(item.get('name', '')))}</td><td>{item.get('score', 0)}</td><td>{escape(str(item.get('last_run_at') or '-'))}</td></tr>"
+            f"<tr><td>{escape(str(item.get('name', '')))}</td>"
+            f"<td>{'-' if item.get('score') is None else str(item['score']) + '%'}</td>"
+            f"<td>{escape(str(item.get('last_run_at') or '-'))}</td></tr>"
             for item in insights.get("dataset_health", [])
         )
         datasets_html = "".join(
             f"<tr><td>{escape(dataset.name)}</td><td>{escape(dataset.domain)}</td><td>{escape(dataset.source_type)}</td><td>{escape(dataset.last_run_at.isoformat() if dataset.last_run_at else '-')}</td></tr>"
             for dataset in datasets
         )
-        week = kpis.get("week", {})
-        week_rows = "".join(
-            f"<tr><td>{escape(metric)}</td><td>{data.get('current')}</td><td>{data.get('previous')}</td><td>{data.get('delta_pct')}%</td></tr>"
-            for metric, data in week.items()
-        )
+        trend = kpis.get("quality_trend")
+        if trend:
+            trend_text = (
+                f"{trend['previous']}% -> {trend['current']}% "
+                f"({trend['delta_points']:+} puntos), comparando la ultima corrida "
+                f"contra la anterior en {trend['datasets_compared']} dataset(s)."
+            )
+        else:
+            trend_text = (
+                "Sin comparacion disponible: ningun dataset tiene todavia dos corridas."
+            )
         html = f"""
 <!doctype html>
 <html lang="es">
@@ -485,19 +462,18 @@ def export_report(
   <div class="meta">Generado: {escape(report['generated_at'])}</div>
 
   <div class="grid">
-    <div class="card"><strong>Datasets</strong><div>{kpis.get('datasets')}</div></div>
-    <div class="card"><strong>Alertas abiertas</strong><div>{kpis.get('open_cases')}</div></div>
-    <div class="card"><strong>Issues</strong><div>{kpis.get('issues')}</div></div>
-    <div class="card"><strong>Impacto</strong><div>{kpis.get('impact_estimated')}</div></div>
-    <div class="card"><strong>Riesgo</strong><div>{kpis.get('risk_score')}</div></div>
+    <div class="card"><strong>Datasets analizados</strong><div>{kpis.get('datasets_analyzed')} de {kpis.get('datasets')}</div></div>
+    <div class="card"><strong>Calidad de datos</strong><div>{kpis.get('quality_score')}%</div></div>
+    <div class="card"><strong>Filas afectadas</strong><div>{kpis.get('rows_affected')} de {kpis.get('total_rows')} ({kpis.get('rows_affected_pct')}%)</div></div>
+    <div class="card"><strong>Filas criticas</strong><div>{kpis.get('critical_rows')} ({kpis.get('critical_rows_pct')}%)</div></div>
+    <div class="card"><strong>Hallazgos</strong><div>{kpis.get('findings')} ({kpis.get('rule_violations')} violaciones)</div></div>
+    <div class="card"><strong>Anomalias</strong><div>{kpis.get('anomalies')}</div></div>
+    <div class="card"><strong>Casos abiertos</strong><div>{kpis.get('open_cases')}</div></div>
   </div>
 
   <div class="section">
-    <h2>Comparativa semanal</h2>
-    <table>
-      <thead><tr><th>Métrica</th><th>Actual</th><th>Anterior</th><th>Delta</th></tr></thead>
-      <tbody>{week_rows}</tbody>
-    </table>
+    <h2>Tendencia de calidad</h2>
+    <p class="meta">{trend_text}</p>
   </div>
 
   <div class="section">
@@ -519,7 +495,7 @@ def export_report(
   <div class="section">
     <h2>Salud por dataset</h2>
     <table>
-      <thead><tr><th>Dataset</th><th>Score</th><th>Última corrida</th></tr></thead>
+      <thead><tr><th>Dataset</th><th>Calidad</th><th>Ultima corrida</th></tr></thead>
       <tbody>{health_html or "<tr><td colspan='3'>Sin datos</td></tr>"}</tbody>
     </table>
   </div>
@@ -543,14 +519,17 @@ def export_report(
     writer = csv.writer(output)
     writer.writerow(["section", "metric", "value", "extra"])
     for key, value in kpis.items():
-        if key == "week":
+        if key == "quality_trend":
             continue
         writer.writerow(["kpi", key, value, ""])
-    week = kpis.get("week", {})
-    for metric, data in week.items():
-        writer.writerow(["week", f"{metric}_current", data.get("current"), ""])
-        writer.writerow(["week", f"{metric}_previous", data.get("previous"), ""])
-        writer.writerow(["week", f"{metric}_delta_pct", data.get("delta_pct"), ""])
+    trend = kpis.get("quality_trend")
+    if trend:
+        writer.writerow(["trend", "quality_current", trend["current"], ""])
+        writer.writerow(["trend", "quality_previous", trend["previous"], ""])
+        writer.writerow(["trend", "quality_delta_points", trend["delta_points"], ""])
+        writer.writerow(["trend", "datasets_compared", trend["datasets_compared"], ""])
+    else:
+        writer.writerow(["trend", "quality_delta_points", "", "sin corrida previa"])
     for item in insights.get("issues_by_code_all", []):
         writer.writerow(["issue", item.get("label"), item.get("value"), ""])
     for item in insights.get("anomalies_by_field_all", []):

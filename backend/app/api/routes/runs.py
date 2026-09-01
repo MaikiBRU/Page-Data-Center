@@ -6,7 +6,14 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, get_db
+from app.api.deps import (
+    Principal,
+    demo_quota_error,
+    get_db,
+    get_principal,
+    scope_datasets,
+)
+from app.services import demo_session as demo_service
 from app.models.dataset import Dataset
 from app.models.dataset_run import DatasetRun
 
@@ -53,11 +60,14 @@ def list_runs(
     limit: int = 200,
     format: str = "json",
     db: Session = Depends(get_db),
-    user=Depends(get_current_user),
+    principal: Principal = Depends(get_principal),
 ):
     from_dt = _parse_date(from_date)
     to_dt = _parse_date(to_date)
-    query = db.query(DatasetRun, Dataset).join(Dataset, Dataset.id == DatasetRun.dataset_id)
+    query = scope_datasets(
+        db.query(DatasetRun, Dataset).join(Dataset, Dataset.id == DatasetRun.dataset_id),
+        principal,
+    )
     query = _apply_filters(query, dataset_id, from_dt, to_dt, min_risk, min_rows)
     query = query.order_by(DatasetRun.run_at.desc()).limit(min(limit, 5000))
     rows = query.all()
@@ -84,6 +94,13 @@ def list_runs(
         return results
     if format.lower() != "csv":
         raise HTTPException(status_code=400, detail="Unsupported format")
+
+    if principal.is_demo:
+        try:
+            demo_service.assert_can_export(principal.demo)
+        except demo_service.DemoQuotaExceeded as exc:
+            raise demo_quota_error(exc) from None
+        demo_service.register_export(db, principal.demo)
 
     output = io.StringIO()
     writer = csv.writer(output)
@@ -131,11 +148,13 @@ def runs_summary(
     min_risk: float | None = None,
     min_rows: int | None = None,
     db: Session = Depends(get_db),
-    user=Depends(get_current_user),
+    principal: Principal = Depends(get_principal),
 ):
     from_dt = _parse_date(from_date)
     to_dt = _parse_date(to_date)
-    query = db.query(DatasetRun).join(Dataset, Dataset.id == DatasetRun.dataset_id)
+    query = scope_datasets(
+        db.query(DatasetRun).join(Dataset, Dataset.id == DatasetRun.dataset_id), principal
+    )
     query = _apply_filters(query, dataset_id, from_dt, to_dt, min_risk, min_rows)
     runs = query.all()
 

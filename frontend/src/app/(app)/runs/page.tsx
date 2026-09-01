@@ -13,11 +13,13 @@ import {
 } from "recharts";
 import { apiFetch, API_URL } from "@/lib/api";
 import { getToken } from "@/lib/auth";
+import { entryPath } from "@/lib/demo";
 import { emitToast } from "@/lib/toast";
-import { FlowSteps } from "@/components/FlowSteps";
 import { OnboardingCoach } from "@/components/OnboardingCoach";
 import { useFlowData } from "@/lib/flow";
 import { EmptyState } from "@/components/EmptyState";
+import { ErrorState } from "@/components/ErrorState";
+import { formatDateTime, formatNumber } from "@/lib/format";
 
 type DatasetOption = {
   id: number;
@@ -55,6 +57,7 @@ export default function RunsPage() {
   const [runs, setRuns] = useState<RunItem[]>([]);
   const [summary, setSummary] = useState<Summary | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [filters, setFilters] = useState({
     dataset_id: "",
     from_date: "",
@@ -85,9 +88,13 @@ export default function RunsPage() {
       setDatasets(ds);
       setRuns(runList);
       setSummary(sum);
-    } catch {
+      setLoadError(null);
+    } catch (err) {
       setRuns([]);
       setSummary(null);
+      // Without this the five summary cards fell back to zeros, presenting an
+      // unreachable API as "0 corridas, 0 filas, calidad media 0%".
+      setLoadError((err as Error).message);
     } finally {
       setLoading(false);
     }
@@ -95,23 +102,14 @@ export default function RunsPage() {
 
   useEffect(() => {
     if (!getToken()) {
-      router.push("/login");
+      router.push(entryPath());
       return;
     }
     load();
   }, [router, load]);
 
-  const formatDate = (value?: string | null) => {
-    if (!value) return "-";
-    const date = new Date(value);
-    if (Number.isNaN(date.getTime())) return value;
-    return new Intl.DateTimeFormat("es-AR", {
-      day: "2-digit",
-      month: "short",
-      hour: "2-digit",
-      minute: "2-digit",
-    }).format(date);
-  };
+  /** "-" rather than 0 whenever the figure was never actually received. */
+  const kpi = (value?: number | null) => (loadError ? "—" : formatNumber(value ?? 0));
 
   const formatDuration = (value?: number | null) => {
     if (!value) return "-";
@@ -144,94 +142,145 @@ export default function RunsPage() {
   return (
     <div className="flex flex-col gap-8">
       <div>
-        <p className="text-xs uppercase tracking-[0.3em] text-white/40">Corridas</p>
+        <p className="text-xs uppercase tracking-[0.3em] text-white/55">Corridas</p>
         <h2 className="mt-2 text-3xl font-semibold">Historial de calidad</h2>
       </div>
-
-      <FlowSteps flow={flow} />
 
       <OnboardingCoach
         flow={flow}
         stepKey="runs"
         title="Ejecutá la primera corrida"
-        description="Seleccioná un dataset y ejecutá calidad para generar issues."
+        description="Seleccioná un dataset y ejecutá calidad para generar hallazgos."
         actionLabel="Ir a Datasets"
         href="/datasets"
       />
 
-      <section className="panel grid gap-4 md:grid-cols-5">
-        <select
-          className="input-base"
-          value={filters.dataset_id}
-          onChange={(event) => setFilters({ ...filters, dataset_id: event.target.value })}
-        >
-          <option value="">Todos los datasets</option>
-          {datasets.map((dataset) => (
-            <option key={dataset.id} value={String(dataset.id)}>
-              {dataset.name}
-            </option>
-          ))}
-        </select>
-        <input
-          className="input-base"
-          type="date"
-          value={filters.from_date}
-          onChange={(event) => setFilters({ ...filters, from_date: event.target.value })}
-        />
-        <input
-          className="input-base"
-          type="date"
-          value={filters.to_date}
-          onChange={(event) => setFilters({ ...filters, to_date: event.target.value })}
-        />
-        <input
-          className="input-base"
-          type="number"
-          placeholder="Riesgo min"
-          value={filters.min_risk}
-          onChange={(event) => setFilters({ ...filters, min_risk: event.target.value })}
-        />
-        <input
-          className="input-base"
-          type="number"
-          placeholder="Filas mín."
-          value={filters.min_rows}
-          onChange={(event) => setFilters({ ...filters, min_rows: event.target.value })}
-        />
+      {loadError && !loading && (
+        <ErrorState title="No se pudieron cargar las corridas" message={loadError} onRetry={load} compact />
+      )}
+
+      {/* The two date pickers used to be unlabelled and identical: there was
+          no way to tell "desde" from "hasta" without clicking one. */}
+      <section className="panel">
+        <p className="text-xs uppercase tracking-[0.3em] text-white/55">Filtros</p>
+        <div className="mt-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
+          <label className="grid gap-1.5 text-xs text-white/70">
+            Dataset
+            <select
+              className="input-base"
+              value={filters.dataset_id}
+              onChange={(event) =>
+                setFilters({ ...filters, dataset_id: event.target.value })
+              }
+            >
+              <option value="">Todos los datasets</option>
+              {datasets.map((dataset) => (
+                <option key={dataset.id} value={String(dataset.id)}>
+                  {dataset.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="grid gap-1.5 text-xs text-white/70">
+            Desde
+            <input
+              className="input-base"
+              type="date"
+              value={filters.from_date}
+              onChange={(event) =>
+                setFilters({ ...filters, from_date: event.target.value })
+              }
+            />
+          </label>
+          <label className="grid gap-1.5 text-xs text-white/70">
+            Hasta
+            <input
+              className="input-base"
+              type="date"
+              value={filters.to_date}
+              onChange={(event) =>
+                setFilters({ ...filters, to_date: event.target.value })
+              }
+            />
+          </label>
+          <label className="grid gap-1.5 text-xs text-white/70">
+            % filas criticas minimo
+            <input
+              className="input-base"
+              type="number"
+              min={0}
+              max={100}
+              placeholder="0"
+              value={filters.min_risk}
+              onChange={(event) =>
+                setFilters({ ...filters, min_risk: event.target.value })
+              }
+            />
+          </label>
+          <label className="grid gap-1.5 text-xs text-white/70">
+            Filas minimas
+            <input
+              className="input-base"
+              type="number"
+              min={0}
+              placeholder="0"
+              value={filters.min_rows}
+              onChange={(event) =>
+                setFilters({ ...filters, min_rows: event.target.value })
+              }
+            />
+          </label>
+        </div>
       </section>
 
-      <section className="grid gap-6 md:grid-cols-3 xl:grid-cols-5 items-stretch">
-        <div className="panel kpi-card h-full">
-          <p className="text-xs uppercase tracking-[0.3em] text-white/40">Corridas</p>
-          <p className="mt-4 text-3xl font-semibold">{summary?.total_runs ?? 0}</p>
-          <p className="mt-3 text-xs text-[var(--muted)]">Total filtrado</p>
-        </div>
-        <div className="panel kpi-card h-full">
-          <p className="text-xs uppercase tracking-[0.3em] text-white/40">Filas</p>
-          <p className="mt-4 text-3xl font-semibold">{summary?.total_rows ?? 0}</p>
-          <p className="mt-3 text-xs text-[var(--muted)]">Registros analizados</p>
-        </div>
-        <div className="panel kpi-card h-full">
-          <p className="text-xs uppercase tracking-[0.3em] text-white/40">Issues</p>
-          <p className="mt-4 text-3xl font-semibold">{summary?.total_issues ?? 0}</p>
-          <p className="mt-3 text-xs text-[var(--muted)]">Registros afectados</p>
-        </div>
-        <div className="panel kpi-card h-full">
-          <p className="text-xs uppercase tracking-[0.3em] text-white/40">Riesgo medio</p>
-          <p className="mt-4 text-3xl font-semibold">{summary?.avg_risk_score ?? 0}</p>
-          <p className="mt-3 text-xs text-[var(--muted)]">Promedio filtrado</p>
-        </div>
-        <div className="panel kpi-card h-full">
-          <p className="text-xs uppercase tracking-[0.3em] text-white/40">Calidad media</p>
-          <p className="mt-4 text-3xl font-semibold">{summary?.avg_quality_score ?? 0}</p>
-          <p className="mt-3 text-xs text-[var(--muted)]">Score promedio</p>
-        </div>
+      <section className="grid grid-cols-2 items-stretch gap-3 sm:gap-4 xl:grid-cols-5">
+        {[
+          {
+            etiqueta: "Corridas",
+            valor: kpi(summary?.total_runs),
+            pie: "En el filtro actual",
+          },
+          {
+            etiqueta: "Filas",
+            valor: kpi(summary?.total_rows),
+            pie: "Registros analizados",
+          },
+          {
+            // total_issues sums run.issue_rows, which the backend fills with
+            // rule_violations(): it counts rule firings, not distinct rows.
+            etiqueta: "Violaciones",
+            valor: kpi(summary?.total_issues),
+            pie: "Reglas disparadas en total",
+          },
+          {
+            etiqueta: "% criticas medio",
+            valor: loadError ? "—" : `${summary?.avg_risk_score ?? 0}%`,
+            pie: "Promedio de las corridas",
+          },
+          {
+            etiqueta: "Calidad media",
+            valor: loadError ? "—" : `${summary?.avg_quality_score ?? 0}%`,
+            pie: "Promedio de las corridas",
+          },
+        ].map((item) => (
+          <div key={item.etiqueta} className="panel h-full">
+            <p className="text-xs uppercase tracking-[0.3em] text-white/55">
+              {item.etiqueta}
+            </p>
+            {loading ? (
+              <div className="skeleton mt-4 h-9 w-20" />
+            ) : (
+              <p className="mt-3 text-3xl font-semibold">{item.valor}</p>
+            )}
+            <p className="mt-2 text-xs leading-snug text-white/70">{item.pie}</p>
+          </div>
+        ))}
       </section>
 
       <section className="panel">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
-            <p className="text-xs uppercase tracking-[0.3em] text-white/40">Tendencia</p>
+            <p className="text-xs uppercase tracking-[0.3em] text-white/55">Tendencia</p>
             <h3 className="mt-2 text-xl font-semibold">Corridas por día</h3>
           </div>
           <button className="btn-secondary" onClick={exportCsv}>
@@ -243,7 +292,10 @@ export default function RunsPage() {
             <div className="skeleton h-full" />
           ) : summary?.runs_by_day?.length ? (
             <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={summary.runs_by_day}>
+              <AreaChart
+                data={summary.runs_by_day}
+                margin={{ top: 8, right: 16, bottom: 0, left: 0 }}
+              >
                 <defs>
                   <linearGradient id="runsSeries" x1="0" y1="0" x2="0" y2="1">
                     <stop offset="5%" stopColor="#ff7a1a" stopOpacity={0.7} />
@@ -255,9 +307,17 @@ export default function RunsPage() {
                   tick={{ fill: "#9fb0c9", fontSize: 11 }}
                   tickFormatter={(value) => value.slice(5)}
                 />
-                <YAxis tick={{ fill: "#9fb0c9", fontSize: 11 }} />
+                <YAxis tick={{ fill: "#9fb0c9", fontSize: 11 }} allowDecimals={false} />
                 <Tooltip contentStyle={{ background: "#101827", border: "1px solid rgba(255,255,255,0.1)" }} />
-                <Area type="monotone" dataKey="runs" stroke="#ff7a1a" fill="url(#runsSeries)" strokeWidth={2} />
+                <Area
+                  type="monotone"
+                  dataKey="runs"
+                  stroke="#ff7a1a"
+                  fill="url(#runsSeries)"
+                  strokeWidth={2}
+                  dot={{ r: 2.5, fill: "#ff7a1a", stroke: "none" }}
+                  activeDot={{ r: 4 }}
+                />
               </AreaChart>
             </ResponsiveContainer>
           ) : (
@@ -276,7 +336,7 @@ export default function RunsPage() {
       <section className="panel">
         <div className="flex items-center justify-between">
           <div>
-            <p className="text-xs uppercase tracking-[0.3em] text-white/40">Detalle</p>
+            <p className="text-xs uppercase tracking-[0.3em] text-white/55">Detalle</p>
             <h3 className="mt-2 text-xl font-semibold">Corridas registradas</h3>
           </div>
           <button
@@ -305,17 +365,17 @@ export default function RunsPage() {
                 <div>
                   <p className="text-white">{run.dataset_name}</p>
                   <p className="text-xs text-[var(--muted)]">
-                    {formatDate(run.run_at)} · {run.domain}
+                    {formatDateTime(run.run_at)} · {run.domain}
                   </p>
                 </div>
-                <div className="text-xs text-white/60">
-                  Filas: {run.total_rows ?? 0} · Issues: {run.issue_rows ?? 0} · Anomalías:{" "}
-                  {run.anomaly_count ?? 0}
+                <div className="text-xs text-white/70">
+                  {formatNumber(run.total_rows)} filas · {formatNumber(run.issue_rows)}{" "}
+                  violaciones · {formatNumber(run.anomaly_count)} anomalias
                 </div>
-                <div className="text-xs text-white/60">
-                  Riesgo: {run.risk_score ?? 0} · Calidad: {run.quality_score ?? 0}
+                <div className="text-xs text-white/70">
+                  Calidad {run.quality_score ?? 0}% · Criticas {run.risk_score ?? 0}%
                 </div>
-                <div className="text-xs text-white/60">{formatDuration(run.duration_ms)}</div>
+                <div className="text-xs text-white/70">{formatDuration(run.duration_ms)}</div>
                 <Link className="btn-secondary" href={`/datasets/${run.dataset_id}`}>
                   Ver dataset
                 </Link>

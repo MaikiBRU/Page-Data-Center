@@ -25,3 +25,7 @@ class Case(Base):
     escalated_to = Column(String(120), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    # Denormalised from the owning dataset so every case query can be scoped
+    # without a join. NULL means it belongs to the authenticated application.
+    demo_session_id = Column(String(64), index=True, nullable=True)
