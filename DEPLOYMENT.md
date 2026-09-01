@@ -76,17 +76,39 @@ Proxy: Proxied
 
 The frontend uses OpenNext for Cloudflare Workers.
 
-Required build/runtime variable:
+### The API URL is baked in at build time
 
-```env
-NEXT_PUBLIC_API_URL=https://api-datacenter.aaronbrumat.com.ar
-```
+`NEXT_PUBLIC_*` variables are not read at runtime: Next.js substitutes them
+into the client bundle during `next build`. Three consequences follow, and
+getting any of them wrong ships a frontend that calls the wrong host while
+still building and deploying successfully.
 
-Local deploy command from `frontend/`:
+1. **`vars` in `wrangler.jsonc` does not cover this.** Those are runtime
+   bindings for the Worker. The browser code has already been compiled by
+   then, so the entry there is inert for `NEXT_PUBLIC_API_URL`.
+2. **`.env.local` wins over everything and is read during production builds
+   too.** A developer machine with `NEXT_PUBLIC_API_URL=http://127.0.0.1:8000`
+   in `frontend/.env.local` will bake *localhost* into the deployed bundle,
+   and every visitor gets "No se pudo contactar el servidor".
+3. **So the variable must be exported in the shell that runs the build**, not
+   only configured in Cloudflare.
+
+Deploy from `frontend/` like this:
 
 ```powershell
+$env:NEXT_PUBLIC_API_URL = "https://api-datacenter.aaronbrumat.com.ar"
 npm run deploy
 ```
+
+Verify before shipping — the production host must appear in the compiled
+assets and localhost must not:
+
+```powershell
+Select-String -Path .open-next/assets/_next/static/chunks/*.js -Pattern "api-datacenter" -List
+Select-String -Path .open-next/assets/_next/static/chunks/*.js -Pattern "localhost:8000" -List
+```
+
+The first command must return matches and the second must return none.
 
 After the Worker is live, bind the custom domain:
 

@@ -428,6 +428,17 @@ def export_report(
             f"<tr><td>{escape(dataset.name)}</td><td>{escape(dataset.domain)}</td><td>{escape(dataset.source_type)}</td><td>{escape(dataset.last_run_at.isoformat() if dataset.last_run_at else '-')}</td></tr>"
             for dataset in datasets
         )
+        # The row based figures are only meaningful when at least one dataset
+        # has been analysed since row level tracking landed. The interface
+        # already checks datasets_measured before showing them; the export did
+        # not, so a database whose runs all predate the migration produced a
+        # report stating "Calidad de datos: 0%" -- a measurement that was never
+        # taken, presented as a fact.
+        measured = int(kpis.get("datasets_measured", 0) or 0) > 0
+
+        def measured_or_dash(value: object, suffix: str = "") -> str:
+            return f"{value}{suffix}" if measured else "sin medir"
+
         trend = kpis.get("quality_trend")
         if trend:
             trend_text = (
@@ -444,7 +455,7 @@ def export_report(
 <html lang="es">
 <head>
   <meta charset="utf-8" />
-  <title>Reporte Ejecutivo - Control Center</title>
+  <title>Reporte Ejecutivo - Data Center</title>
   <style>
     body {{ font-family: Arial, sans-serif; background: #f7f7f8; color: #111; margin: 0; padding: 32px; }}
     h1, h2 {{ margin: 0 0 8px 0; }}
@@ -463,9 +474,9 @@ def export_report(
 
   <div class="grid">
     <div class="card"><strong>Datasets analizados</strong><div>{kpis.get('datasets_analyzed')} de {kpis.get('datasets')}</div></div>
-    <div class="card"><strong>Calidad de datos</strong><div>{kpis.get('quality_score')}%</div></div>
-    <div class="card"><strong>Filas afectadas</strong><div>{kpis.get('rows_affected')} de {kpis.get('total_rows')} ({kpis.get('rows_affected_pct')}%)</div></div>
-    <div class="card"><strong>Filas criticas</strong><div>{kpis.get('critical_rows')} ({kpis.get('critical_rows_pct')}%)</div></div>
+    <div class="card"><strong>Calidad de datos</strong><div>{measured_or_dash(kpis.get('quality_score'), '%')}</div></div>
+    <div class="card"><strong>Filas afectadas</strong><div>{measured_or_dash(str(kpis.get('rows_affected')) + ' de ' + str(kpis.get('total_rows')) + ' (' + str(kpis.get('rows_affected_pct')) + '%)')}</div></div>
+    <div class="card"><strong>Filas criticas</strong><div>{measured_or_dash(str(kpis.get('critical_rows')) + ' (' + str(kpis.get('critical_rows_pct')) + '%)')}</div></div>
     <div class="card"><strong>Hallazgos</strong><div>{kpis.get('findings')} ({kpis.get('rule_violations')} violaciones)</div></div>
     <div class="card"><strong>Anomalias</strong><div>{kpis.get('anomalies')}</div></div>
     <div class="card"><strong>Casos abiertos</strong><div>{kpis.get('open_cases')}</div></div>

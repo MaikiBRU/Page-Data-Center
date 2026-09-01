@@ -302,7 +302,20 @@ def purge_session_data(db: Session, session_id: str) -> dict[str, int]:
     Idempotent: running it twice on the same id deletes nothing the second
     time and raises nothing. Ordered leaves-first so no step depends on rows
     another step already removed.
+
+    Raises:
+        ValueError: if ``session_id`` is empty. Every filter below compares
+            ``demo_session_id`` to it, and SQLAlchemy turns ``column == None``
+            into ``IS NULL`` -- which is exactly how the authenticated
+            application's rows are marked. A None slipping through would
+            therefore select the whole application partition and delete it,
+            and the commit at the end of this function makes that
+            unrecoverable. No caller can currently do it; this makes it
+            impossible rather than merely unlikely.
     """
+    if not session_id:
+        raise ValueError("purge_session_data requires a demo session id")
+
     removed: dict[str, int] = {}
 
     dataset_ids = [

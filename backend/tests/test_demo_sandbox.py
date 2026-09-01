@@ -715,3 +715,29 @@ def test_maintenance_cleanup_requires_the_right_secret(client, db):
         assert db.query(DemoSession).count() == 0
     finally:
         settings.demo_maintenance_token = None
+
+
+# --- teardown guard --------------------------------------------------------
+
+
+@pytest.mark.parametrize("falsy_id", [None, ""])
+def test_purge_refuses_an_empty_session_id_instead_of_wiping_the_app(client, db, falsy_id):
+    """The filters compare demo_session_id to the argument, and SQLAlchemy
+    turns ``== None`` into ``IS NULL`` -- which is how the authenticated
+    application's own rows are marked. Without the guard this call would
+    delete every real dataset and case, and purge commits.
+    """
+    admin, _ = make_admin(db)
+    app_dataset = Dataset(name="Dataset real", domain="ecommerce", created_by=admin.id)
+    db.add(app_dataset)
+    db.commit()
+    db.refresh(app_dataset)
+    app_case = Case(dataset_id=app_dataset.id, title="Caso real", severity="high", status="open")
+    db.add(app_case)
+    db.commit()
+
+    with pytest.raises(ValueError):
+        demo_service.purge_session_data(db, falsy_id)
+
+    assert db.query(Dataset).filter(Dataset.id == app_dataset.id).count() == 1
+    assert db.query(Case).filter(Case.id == app_case.id).count() == 1
