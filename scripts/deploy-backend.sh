@@ -10,7 +10,7 @@
 #   ./scripts/deploy-backend.sh
 #
 # Que hace, en orden:
-#   1. comprueba que estas en el directorio correcto y que hay un .env;
+#   1. comprueba el directorio, docker-compose.prod.yml y .env.prod;
 #   2. respalda la base de datos ANTES de tocar nada;
 #   3. trae el commit nuevo;
 #   4. reconstruye la imagen de la API;
@@ -28,9 +28,15 @@
 set -euo pipefail
 
 RAMA="${RAMA:-codex/public-clean}"
+COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.prod.yml}"
+ENV_FILE="${ENV_FILE:-.env.prod}"
 SERVICIO_API="${SERVICIO_API:-api}"
 SERVICIO_DB="${SERVICIO_DB:-db}"
 DIR_BACKUPS="${DIR_BACKUPS:-$HOME/backups}"
+
+# Todo pasa por el compose de produccion y su env file. El
+# docker-compose.yml de la raiz solo define la base para desarrollo local.
+dc() { docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "$@"; }
 
 rojo() { printf '\033[31m%s\033[0m\n' "$*"; }
 verde() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -39,28 +45,28 @@ paso() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 # --- 1. comprobaciones previas ---------------------------------------------
 paso "Comprobaciones previas"
 
-if [ ! -f docker-compose.yml ] && [ ! -f docker-compose.yaml ]; then
-  rojo "No hay docker-compose.yml aca. Ejecutalo desde el directorio de la aplicacion."
+if [ ! -f "$COMPOSE_FILE" ]; then
+  rojo "No se encuentra $COMPOSE_FILE. Ejecutalo desde ~/data-center."
   exit 1
 fi
 
-if [ ! -f .env ]; then
-  rojo "Falta .env. El backend no arranca sin SECRET_KEY."
+if [ ! -f "$ENV_FILE" ]; then
+  rojo "Falta $ENV_FILE. El backend no arranca sin SECRET_KEY."
   exit 1
 fi
 
-if ! grep -q '^SECRET_KEY=.\+' .env; then
-  rojo "SECRET_KEY esta vacia o ausente en .env."
+if ! grep -q '^SECRET_KEY=.\+' "$ENV_FILE"; then
+  rojo "SECRET_KEY esta vacia o ausente en $ENV_FILE."
   exit 1
 fi
 
-if ! grep -q '^ENVIRONMENT=production' .env; then
-  rojo "ENVIRONMENT no es 'production' en .env."
-  rojo "En desarrollo se sirven /docs y /openapi.json publicamente."
+if ! grep -q '^ENVIRONMENT=production' "$ENV_FILE"; then
+  rojo "ENVIRONMENT no es 'production' en $ENV_FILE."
+  rojo "Fuera de produccion se sirven /docs y /openapi.json publicamente."
   exit 1
 fi
 
-verde "Directorio, .env, SECRET_KEY y ENVIRONMENT correctos."
+verde "Directorio, $ENV_FILE, SECRET_KEY y ENVIRONMENT correctos."
 
 # --- 2. respaldo ------------------------------------------------------------
 paso "Respaldo de la base de datos"
@@ -70,10 +76,10 @@ SELLO="$(date +%Y%m%d-%H%M%S)"
 ARCHIVO="$DIR_BACKUPS/data_quality-$SELLO.sql.gz"
 
 # El usuario y la base salen del propio contenedor, no de valores adivinados.
-USUARIO_DB="$(docker compose exec -T "$SERVICIO_DB" printenv POSTGRES_USER | tr -d '\r')"
-NOMBRE_DB="$(docker compose exec -T "$SERVICIO_DB" printenv POSTGRES_DB | tr -d '\r')"
+USUARIO_DB="$(dc exec -T "$SERVICIO_DB" printenv POSTGRES_USER | tr -d '\r')"
+NOMBRE_DB="$(dc exec -T "$SERVICIO_DB" printenv POSTGRES_DB | tr -d '\r')"
 
-docker compose exec -T "$SERVICIO_DB" pg_dump -U "$USUARIO_DB" "$NOMBRE_DB" | gzip > "$ARCHIVO"
+dc exec -T "$SERVICIO_DB" pg_dump -U "$USUARIO_DB" "$NOMBRE_DB" | gzip > "$ARCHIVO"
 
 TAM="$(du -h "$ARCHIVO" | cut -f1)"
 if [ ! -s "$ARCHIVO" ]; then
@@ -99,13 +105,13 @@ git log --oneline -1
 
 # --- 4. construir -----------------------------------------------------------
 paso "Construyendo la imagen de la API"
-docker compose build "$SERVICIO_API"
+dc build "$SERVICIO_API"
 
 # --- 5. levantar ------------------------------------------------------------
 # El entrypoint corre `alembic upgrade head` antes de uvicorn. Si una migracion
 # falla, el contenedor no arranca y la version anterior sigue en pie.
 paso "Levantando la API (aplica migraciones al arrancar)"
-docker compose up -d "$SERVICIO_API"
+dc up -d "$SERVICIO_API"
 
 # --- 6. verificar -----------------------------------------------------------
 paso "Verificando"
@@ -120,19 +126,19 @@ done
 
 if [ -z "$OK" ]; then
   rojo "/health no respondio 200. Ultimos registros:"
-  docker compose logs --tail 40 "$SERVICIO_API"
+  dc logs --tail 40 "$SERVICIO_API"
   rojo ""
   rojo "La version anterior quedo detenida. Para volver atras:"
-  rojo "  git reset --hard $ANTES && docker compose build $SERVICIO_API && docker compose up -d $SERVICIO_API"
+  rojo "  git reset --hard $ANTES && ./scripts/deploy-backend.sh"
   rojo "Y si hiciera falta restaurar datos:"
-  rojo "  gunzip -c $ARCHIVO | docker compose exec -T $SERVICIO_DB psql -U $USUARIO_DB $NOMBRE_DB"
+  rojo "  gunzip -c $ARCHIVO | docker compose -f $COMPOSE_FILE --env-file $ENV_FILE exec -T $SERVICIO_DB psql -U $USUARIO_DB $NOMBRE_DB"
   exit 1
 fi
 verde "/health responde 200."
 
 echo ""
 echo "Revision de Alembic aplicada:"
-docker compose exec -T "$SERVICIO_API" alembic current 2>/dev/null | tail -2 || true
+dc exec -T "$SERVICIO_API" alembic current 2>/dev/null | tail -2 || true
 
 echo ""
 echo "Endurecimiento (en produccion la documentacion no debe servirse):"
@@ -158,7 +164,7 @@ fi
 echo ""
 if [ "$FALLOS" -gt 0 ]; then
   rojo "El despliegue arranco pero $FALLOS comprobacion(es) de seguridad fallaron."
-  rojo "Revisa ENVIRONMENT=production en .env y reinicia: docker compose up -d $SERVICIO_API"
+  rojo "Revisa ENVIRONMENT=production en $ENV_FILE y reinicia: ./scripts/deploy-backend.sh"
   exit 1
 fi
 

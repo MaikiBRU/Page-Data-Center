@@ -1,0 +1,43 @@
+# Despliegue del backend en la instancia EC2.
+#
+# Vivia solo en el servidor, sin copia en el repositorio: si se perdia la
+# instancia, se perdia la definicion del despliegue. No contiene secretos --
+# los valores llegan por .env.prod, que sigue fuera del control de versiones --
+# asi que se versiona.
+#
+# Uso (en el servidor, desde ~/data-center):
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+#
+# En la practica se invoca desde scripts/deploy-backend.sh, que ademas respalda
+# la base y verifica el resultado.
+
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    env_file: .env.prod
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    env_file: .env.prod
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+volumes:
+  db_data:

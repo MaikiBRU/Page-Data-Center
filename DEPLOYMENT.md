@@ -43,7 +43,10 @@ Puntos que conviene tener claros porque contradicen suposiciones habituales:
 
 ## Backend (EC2)
 
-Ubicacion en el servidor: `~/data-center`.
+Ubicacion en el servidor: `~/data-center`, que es un checkout de
+`codex/public-clean`. El despliegue usa `docker-compose.prod.yml` (servicios
+`db` y `api`) con `--env-file .env.prod`. El `docker-compose.yml` de la raiz
+solo define la base para desarrollo local y no interviene en produccion.
 
 ```bash
 ssh -i <clave>.pem ubuntu@<host>
@@ -51,7 +54,7 @@ cd ~/data-center
 ./scripts/deploy-backend.sh
 ```
 
-El script: comprueba `.env`, **respalda la base**, trae la rama, reconstruye la
+El script: comprueba `.env.prod`, **respalda la base**, trae la rama, reconstruye la
 imagen, levanta el contenedor y verifica. El entrypoint del contenedor corre
 `alembic upgrade head` antes de uvicorn, de modo que el esquema se actualiza
 antes de aceptar trafico; si una migracion falla el contenedor no arranca y la
@@ -83,7 +86,9 @@ score que nunca se midio.
 
 ### Variables de entorno del backend
 
-En `~/data-center/.env`, nunca en el repositorio:
+En `~/data-center/.env.prod`, nunca en el repositorio. Ademas de las de la
+aplicacion, ese archivo aporta `POSTGRES_USER`, `POSTGRES_PASSWORD` y
+`POSTGRES_DB`, que consume el servicio `db` del compose:
 
 ```env
 ENVIRONMENT=production
