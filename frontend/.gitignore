@@ -36,6 +36,11 @@ yarn-error.log*
 # this file wins over the negation in the repository root .gitignore.
 !.env.example
 !.env.*.example
+# .env.production holds only NEXT_PUBLIC_* values, which end up visible in the
+# published JavaScript anyway. It is committed so that a production build no
+# longer depends on whoever runs it having exported the right API URL.
+# .env.production.local stays ignored: that name is for local overrides.
+!.env.production
 
 # vercel
 .vercel

@@ -1,0 +1,83 @@
+name: Deploy frontend (Cloudflare Workers)
+
+# Manual on purpose. The backend lives on an EC2 instance that this workflow
+# cannot reach, so an automatic frontend deploy could publish a frontend newer
+# than the API it talks to. Trigger it once the backend is on the same commit.
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Por que se despliega (queda en el historial del run)"
+        required: false
+        default: "deploy manual"
+
+concurrency:
+  group: deploy-frontend
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Comprobar que las credenciales de Cloudflare estan configuradas
+        env:
+          TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          faltan=""
+          [ -z "$TOKEN" ] && faltan="$faltan CLOUDFLARE_API_TOKEN"
+          [ -z "$ACCOUNT" ] && faltan="$faltan CLOUDFLARE_ACCOUNT_ID"
+          if [ -n "$faltan" ]; then
+            echo "::error::Faltan secrets del repositorio:$faltan"
+            echo "Crealos en Settings > Secrets and variables > Actions."
+            echo "El token necesita el permiso 'Workers Scripts: Edit'."
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+
+      # .env.production supplies NEXT_PUBLIC_API_URL. There is no .env.local in
+      # a clean checkout, so the value cannot be overridden by a developer's
+      # machine here -- which is the whole reason this job exists.
+      - name: Build
+        run: npm run build
+
+      - name: Verificar que el bundle apunta a la API de produccion
+        run: |
+          if ! grep -rqs "api-datacenter.aaronbrumat.com.ar" .next/static/chunks/; then
+            echo "::error::La URL de produccion no quedo en el bundle. No se despliega."
+            exit 1
+          fi
+          if grep -rqsE "localhost:8000|127\.0\.0\.1:8000" .next/static/chunks/; then
+            echo "::error::El bundle contiene una URL local. No se despliega."
+            exit 1
+          fi
+
+      - name: Deploy a Cloudflare Workers
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npm run deploy
+
+      - name: Comprobar el sitio publicado
+        run: |
+          for intento in 1 2 3 4 5; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" -L https://datacenter.aaronbrumat.com.ar/demo || echo 000)
+            echo "intento $intento -> $code"
+            [ "$code" = "200" ] && exit 0
+            sleep 10
+          done
+          echo "::error::El sitio no respondio 200 en /demo despues del deploy."
+          exit 1

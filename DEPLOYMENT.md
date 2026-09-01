@@ -6,148 +6,197 @@ Production domains:
 - Backend API: `https://api-datacenter.aaronbrumat.com.ar`
 - Portfolio link: `https://aaronbrumat.com.ar`
 
-## Backend on AWS
+> **Nota historica.** Una version anterior de este documento describia AWS App
+> Runner, ECR y RDS. Nada de eso esta desplegado. Lo que sigue es la
+> arquitectura verificada contra la infraestructura real.
 
-Recommended AWS services:
+## Arquitectura real
 
-- PostgreSQL: Amazon RDS PostgreSQL.
-- API runtime: AWS App Runner from the `backend/Dockerfile`.
+```
+                        Cloudflare (DNS + TLS + Workers)
+                                    |
+   datacenter.aaronbrumat.com.ar ---+---> Worker (OpenNext / Next.js)
+                                                    |
+                                                    | fetch (https)
+                                                    v
+api-datacenter.aaronbrumat.com.ar --------> EC2  us-east-2, Ubuntu
+                                              |
+                                              +-- Caddy (systemd, TLS)
+                                                    |
+                                                    +-- docker compose
+                                                          |-- api  (imagen data-center-api, uvicorn:8000)
+                                                          `-- db   (postgres:16, volumen local)
+```
 
-App Runner settings:
+Puntos que conviene tener claros porque contradicen suposiciones habituales:
 
-- Source repository: `MaikiBRU/Page-Data-Center`
-- Source directory: `backend`
-- Dockerfile: `Dockerfile`
-- Port: `8000`
-- Health check path: `/health` (verifies the database connection; `/` only
-  reports that the process is up)
+- **No hay RDS.** PostgreSQL corre como contenedor en la misma instancia EC2,
+  con un volumen de Docker. El respaldo es responsabilidad del despliegue, y
+  por eso `scripts/deploy-backend.sh` hace un `pg_dump` antes de tocar nada.
+- **No hay App Runner ni ECR.** La imagen se construye en la propia instancia
+  con `docker compose build`.
+- **No hay integracion automatica GitHub -> AWS.** Un push no despliega el
+  backend. Hay que ejecutar el script en el servidor.
+- El unico workflow que corre solo al hacer push es el de GitHub Pages, que
+  publica el README en `maikibru.github.io/Page-Data-Center`. No es el sitio de
+  produccion y no interviene en el despliegue.
 
-The container entrypoint runs `alembic upgrade head` before uvicorn, so schema
-changes are applied before the API accepts traffic.
+## Backend (EC2)
 
-Required environment variables:
+Ubicacion en el servidor: `~/data-center`.
+
+```bash
+ssh -i <clave>.pem ubuntu@<host>
+cd ~/data-center
+./scripts/deploy-backend.sh
+```
+
+El script: comprueba `.env`, **respalda la base**, trae la rama, reconstruye la
+imagen, levanta el contenedor y verifica. El entrypoint del contenedor corre
+`alembic upgrade head` antes de uvicorn, de modo que el esquema se actualiza
+antes de aceptar trafico; si una migracion falla el contenedor no arranca y la
+version anterior sigue sirviendo.
+
+El script imprime el comando exacto de vuelta atras, incluido el de restaurar
+el volcado, si `/health` no responde.
+
+### Seguridad de las migraciones
+
+`0002` y `0003` son puramente aditivas: crean tablas y agregan columnas
+anulables, cada paso consultando antes el catalogo, asi que son idempotentes y
+no modifican ninguna fila existente. Se validaron reconstruyendo el esquema
+anterior a Alembic (`create_all` mas los `ALTER` de arranque de la version
+vieja) sobre PostgreSQL 16 con datos, aplicando `alembic upgrade head` y
+comprobando que las filas seguian ahi y que `demo_session_id` quedaba en NULL,
+es decir dentro de la particion de la aplicacion.
+
+`0001` es un no-op deliberado: la base de produccion se construyo con
+`create_all` y ALTERs ad-hoc, sin una revision anterior que reproducir, asi que
+la primera revision vacia permite que `alembic upgrade head` funcione tanto
+sobre esa base como sobre una nueva.
+
+**Efecto esperado la primera vez:** los datasets analizados antes de esta
+migracion no tienen conteo de filas distintas y no es recuperable de los
+agregados viejos, asi que el dashboard mostrara "Sin datos" para ellos hasta
+que se vuelva a correr calidad. Es intencional: la alternativa seria mostrar un
+score que nunca se midio.
+
+### Variables de entorno del backend
+
+En `~/data-center/.env`, nunca en el repositorio:
 
 ```env
 ENVIRONMENT=production
-SECRET_KEY=<generate-a-long-random-secret>
-DATABASE_URL=postgresql+psycopg://<user>:<password>@<rds-endpoint>:5432/<database>
+SECRET_KEY=<generar: python -c "import secrets; print(secrets.token_urlsafe(48))">
+DATABASE_URL=postgresql+psycopg://<usuario>:<clave>@db:5432/<base>
 ALLOWED_ORIGINS=https://datacenter.aaronbrumat.com.ar
 FRONTEND_URL=https://datacenter.aaronbrumat.com.ar
-GOOGLE_REDIRECT_URI=https://api-datacenter.aaronbrumat.com.ar/auth/google/callback
 GOOGLE_CLIENT_ID=
 GOOGLE_CLIENT_SECRET=
+GOOGLE_REDIRECT_URI=https://api-datacenter.aaronbrumat.com.ar/auth/google/callback
 SENDGRID_API_KEY=
-EMAIL_FROM=no-reply@aaronbrumat.com.ar
-
-# Demo sandbox. See DEMO.md for the full table and the reasoning behind
-# each limit. The defaults are usable as-is; set the maintenance token only
-# if you want to drive cleanup from outside the process.
 DEMO_ENABLED=true
-DEMO_MAINTENANCE_TOKEN=<generate-a-long-random-secret-or-leave-unset>
+DEMO_MAINTENANCE_TOKEN=
 ```
 
-Cleanup of expired sandboxes runs inside the API process on a timer
-(`DEMO_CLEANUP_INTERVAL_SECONDS`, default 300s), so no scheduler is required.
-Expired sessions are rejected at request time regardless of whether cleanup has
-run yet.
+`SECRET_KEY` es obligatoria y no tiene valor por defecto: la aplicacion no
+arranca sin ella, y rechaza valores conocidos como `change-me`. Cambiarla
+invalida todos los tokens emitidos.
 
-`ENVIRONMENT=production` turns off `/docs`, `/redoc` and `/openapi.json`, and
-forces the password reset link never to be written to a log. Both are on by
-default in development.
+`ENVIRONMENT=production` no es cosmetico. Cierra `/docs`, `/redoc` y
+`/openapi.json`, y fuerza que el enlace de recuperacion de contrasena nunca se
+escriba en un log, sin importar lo que digan las otras variables. El script de
+despliegue aborta si esta variable no esta en produccion, y comprueba despues
+que esas rutas devuelvan 404.
 
-`SECRET_KEY` is required and has no default: the service will not start
-without it.
+## Frontend (Cloudflare Workers)
 
-Brute force protection on `/auth/login` and `/auth/forgot-password` is
-in-process. On a single instance the limits are exact; if App Runner scales to
-several instances each keeps its own counters, so the effective allowance
-multiplies by the instance count. Redis was judged not worth adding for this.
+El frontend usa OpenNext sobre Cloudflare Workers.
 
-After App Runner is live, create a Cloudflare DNS record:
+### La URL de la API se hornea en el build
 
-```text
-Type: CNAME
-Name: api-datacenter
-Target: <app-runner-default-domain>
-Proxy: Proxied
+`NEXT_PUBLIC_API_URL` no se lee en tiempo de ejecucion: Next.js la sustituye
+dentro del bundle del cliente durante `next build`. De ahi salen tres trampas
+que compilan y despliegan sin error pero dejan el frontend llamando al host
+equivocado:
+
+1. **Los `vars` de `wrangler.jsonc` no cubren esto.** Son bindings de runtime
+   del Worker; el codigo del navegador ya fue compilado para entonces.
+2. **`.env.local` gana sobre todo lo demas y tambien se lee en builds de
+   produccion.** Una maquina de desarrollo con `http://127.0.0.1:8000` ahi
+   hornearia localhost en el bundle publicado, y cualquier visitante recibiria
+   "No se pudo contactar el servidor".
+3. Por eso el valor no puede depender de que alguien recuerde exportarlo.
+
+El proyecto lo resuelve en dos capas:
+
+- **`frontend/.env.production`** (versionado) fija la URL de produccion. Un
+  clon limpio o un runner de CI compila correcto sin ningun paso manual. Se
+  versiona a proposito: los valores `NEXT_PUBLIC_*` terminan visibles en el
+  JavaScript publicado, asi que no hay nada que ocultar.
+- **`frontend/next.config.ts`** corta el build de produccion si la variable
+  falta, apunta a una direccion local o no usa https. Convierte el fallo
+  silencioso en un error de build con el comando de solucion en el mensaje.
+
+Para compilar a proposito un bundle de produccion contra un backend local:
+`NEXT_PUBLIC_ALLOW_LOCAL_API=1 npm run build`.
+
+### Desplegar
+
+Preferido, sin depender de la maquina de nadie:
+
+```
+Actions -> "Deploy frontend (Cloudflare Workers)" -> Run workflow
 ```
 
-## Frontend on Cloudflare Workers
+Requiere dos secrets del repositorio (Settings > Secrets and variables >
+Actions):
 
-The frontend uses OpenNext for Cloudflare Workers.
+| Secret | De donde sale |
+| --- | --- |
+| `CLOUDFLARE_API_TOKEN` | Cloudflare > My Profile > API Tokens, permiso `Workers Scripts: Edit` |
+| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare > Workers & Pages, panel derecho |
 
-### The API URL is baked in at build time
+El workflow compila, **verifica que el bundle apunte a la API de produccion y
+no contenga localhost**, despliega y comprueba que `/demo` responda 200.
 
-`NEXT_PUBLIC_*` variables are not read at runtime: Next.js substitutes them
-into the client bundle during `next build`. Three consequences follow, and
-getting any of them wrong ships a frontend that calls the wrong host while
-still building and deploying successfully.
-
-1. **`vars` in `wrangler.jsonc` does not cover this.** Those are runtime
-   bindings for the Worker. The browser code has already been compiled by
-   then, so the entry there is inert for `NEXT_PUBLIC_API_URL`.
-2. **`.env.local` wins over everything and is read during production builds
-   too.** A developer machine with `NEXT_PUBLIC_API_URL=http://127.0.0.1:8000`
-   in `frontend/.env.local` will bake *localhost* into the deployed bundle,
-   and every visitor gets "No se pudo contactar el servidor".
-3. **So the variable must be exported in the shell that runs the build**, not
-   only configured in Cloudflare.
-
-Deploy from `frontend/` like this:
+Manual, desde `frontend/`:
 
 ```powershell
-$env:NEXT_PUBLIC_API_URL = "https://api-datacenter.aaronbrumat.com.ar"
 npm run deploy
 ```
 
-Verify before shipping — the production host must appear in the compiled
-assets and localhost must not:
+Funciona igual, siempre que `.env.local` no tenga una URL local; si la tiene,
+el build se detiene con instrucciones en vez de publicar algo roto.
+
+## Verificacion
 
 ```powershell
-Select-String -Path .open-next/assets/_next/static/chunks/*.js -Pattern "api-datacenter" -List
-Select-String -Path .open-next/assets/_next/static/chunks/*.js -Pattern "localhost:8000" -List
+curl.exe -s -o NUL -w "%{http_code}`n" https://api-datacenter.aaronbrumat.com.ar/health
+curl.exe -s https://api-datacenter.aaronbrumat.com.ar/demo/config
+curl.exe -s -o NUL -w "%{http_code}`n" https://datacenter.aaronbrumat.com.ar/demo
 ```
 
-The first command must return matches and the second must return none.
+Esperado: `/health` devuelve 200 con `database: true`; `/demo/config` devuelve
+los limites configurados; `/demo` responde 200.
 
-After the Worker is live, bind the custom domain:
-
-```text
-datacenter.aaronbrumat.com.ar
-```
-
-## Verification
-
-Expected checks:
+Y estas tres deben devolver **404** en produccion:
 
 ```powershell
-curl.exe -I https://api-datacenter.aaronbrumat.com.ar/
-curl.exe -I https://datacenter.aaronbrumat.com.ar/
+curl.exe -s -o NUL -w "%{http_code}`n" https://api-datacenter.aaronbrumat.com.ar/docs
+curl.exe -s -o NUL -w "%{http_code}`n" https://api-datacenter.aaronbrumat.com.ar/openapi.json
+curl.exe -s -o NUL -w "%{http_code}`n" -X POST https://api-datacenter.aaronbrumat.com.ar/auth/register
 ```
 
-The backend root should return `200 OK`. The frontend root redirects an
-anonymous visitor to `/demo` (not to the login page), and API calls should
-use `https://api-datacenter.aaronbrumat.com.ar`.
+Si `/docs` devuelve 200, `ENVIRONMENT` no es `production`. Si `/auth/register`
+devuelve algo distinto de 404, el backend esta corriendo codigo anterior al
+cierre del registro publico.
 
-Demo sandbox:
-
-```powershell
-curl.exe https://api-datacenter.aaronbrumat.com.ar/health
-curl.exe https://api-datacenter.aaronbrumat.com.ar/demo/config
-curl.exe -I https://datacenter.aaronbrumat.com.ar/demo
-```
-
-`/health` should report `database: true`, `/demo/config` should return the
-configured limits, and `/dashboard` without a session should redirect to
-`/demo` rather than rendering the application shell.
-
-## Portfolio link
-
-Point the portfolio's "Visualizar app" button at:
+## Enlace desde el portfolio
 
 ```text
 https://datacenter.aaronbrumat.com.ar/demo
 ```
 
-`/dashboard` also works — an anonymous visitor is redirected to `/demo` — but
-linking `/demo` directly avoids the extra hop.
+`/dashboard` tambien funciona (un visitante anonimo es redirigido a `/demo`),
+pero enlazar `/demo` evita el salto.
