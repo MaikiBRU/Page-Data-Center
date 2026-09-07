@@ -179,7 +179,7 @@ and never touches rows with `demo_session_id IS NULL`.
 
 | Piece                        | Role                                                       |
 | ---------------------------- | ---------------------------------------------------------- |
-| `src/proxy.ts`               | Server-side routing guard (Next 16 renamed `middleware`)    |
+| `src/app/(app)/layout.tsx`   | Server-side routing guard                                  |
 | `src/app/(auth)/demo/`       | Public landing page                                        |
 | `src/components/DemoBanner`  | One-row status strip: mode, quota, time left, reset/end    |
 | `src/lib/demo.ts`            | Session client and demo-mode flag                          |
@@ -188,8 +188,17 @@ and never touches rows with `demo_session_id IS NULL`.
 anyone. The bounce to `/login` only happened after hydration, when the sidebar's
 unconditional `/auth/me` call came back 401 — so a first-time visitor from the
 portfolio saw the app flash and then a red *"Sesión expirada"* error for a
-session they never had. Now the proxy redirects before anything renders, and the
+session they never had. Now the layout redirects before anything renders, and the
 sidebar no longer calls `/auth/me` without a token.
+
+**Why the guard is not middleware.** It used to live in `src/proxy.ts` (Next 16's
+rename of `middleware.ts`), but that file always runs on the Node.js runtime —
+setting `runtime` there throws — and OpenNext for Cloudflare cannot deploy Node.js
+middleware, so the deploy failed with "Node.js middleware is not currently
+supported" and the whole frontend was undeployable. Doing the same cookie check in
+the `(app)` layout, a server component, keeps the behaviour and works on Workers.
+The side effect is that the application pages render on demand instead of being
+prerendered, which is the right thing for session-dependent screens.
 
 The `dc_has_session` cookie is a **routing** input, not an authorisation one.
 Forging it buys nothing: the page loads and every API call behind it returns
@@ -266,11 +275,18 @@ second run was a no-op.
 - **The authenticated app still writes to the ephemeral filesystem.** Only the
   demo path was moved into the database. Fixing the app path is a separate
   change.
-- **Dashboard metric definitions were not changed** — the "issues" ambiguity,
-  the always-`+100%` weekly deltas and the invented USD impact figure from the
-  audit are all still there. They are cosmetically visible in the demo.
-- **Anomaly detection recall is still ~7%.** The z-score is computed over
-  contaminated data. Unchanged here on purpose; it is its own task.
+Two gaps listed here originally have since been closed, and are recorded below so
+the history is not lost:
+
+- **Dashboard metric definitions.** The "issues" ambiguity, the always-`+100%`
+  weekly deltas and the invented USD impact figure were fixed in a later change.
+  Every dashboard figure is now a row count, a finding count, or a percentage of
+  those two. See [METRICS.md](METRICS.md).
+- **Anomaly detection recall.** It was ~7% because the z-score used the mean and
+  the standard deviation of the contaminated sample, which masked the very
+  outliers being looked for. It now uses the median and the MAD, and measures
+  ~0.81 across 1–30% contamination. See the recall table in
+  [METRICS.md](METRICS.md) and `backend/scripts/eval_anomalies.py`.
 
 ---
 
@@ -280,7 +296,7 @@ second run was a no-op.
 cd backend && python -m pytest
 ```
 
-65 tests, no database container required (SQLite in-memory, the real app
+277 tests, no database container required (SQLite in-memory, the real app
 otherwise). Coverage: session creation, valid/expired/idle/revoked/unknown
 sessions, forged and wrong-secret tokens, cross-session isolation for datasets,
 cases, runs, KPIs and bulk operations, IDOR on read and write, every quota,
